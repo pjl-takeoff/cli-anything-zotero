@@ -243,8 +243,10 @@ def zoterify_document(
     output_path = Path(working["output"])
     try:
         open_result = _open_in_libreoffice(output_path) if open_document else {"attempted": False, "ok": None}
+        activation_result = {"attempted": False, "ok": None}
         if open_result.get("ok"):
             time.sleep(3)
+            activation_result = _prime_libreoffice_active_document(output_path)
         zoterify_js = _zoterify_js(
             placeholders=working["placeholders"],
             bibliography_placeholder=working["bibliography_placeholder"],
@@ -326,6 +328,7 @@ def zoterify_document(
         "save": save_result,
         "ready_for_user": ready_for_user,
         "open": open_result,
+        "libreoffice_activation": activation_result,
         "zotero_startup": zotero_startup,
         "libreoffice_warmup": warmup_result,
         "bridge": bridge_payload,
@@ -665,10 +668,10 @@ def _normalize_probe_payload(data: dict[str, Any], *, bridge: Any, backend: str)
 def _open_in_libreoffice(path: Path) -> dict[str, Any]:
     if sys.platform == "darwin":
         try:
-            subprocess.run(["open", "-a", "LibreOffice", str(path)], capture_output=True, text=True, timeout=10, check=False)
+            subprocess.run(["open", "-g", "-a", "LibreOffice", str(path)], capture_output=True, text=True, timeout=10, check=False)
         except (OSError, subprocess.TimeoutExpired) as exc:
             return {"attempted": True, "ok": False, "error": str(exc)}
-        return {"attempted": True, "ok": True, "method": "open -a LibreOffice"}
+        return {"attempted": True, "ok": True, "method": "open -g -a LibreOffice"}
 
     soffice = docx_tools._find_libreoffice_executable()
     if soffice is None:
@@ -678,6 +681,45 @@ def _open_in_libreoffice(path: Path) -> dict[str, Any]:
     except OSError as exc:
         return {"attempted": True, "ok": False, "soffice": str(soffice), "error": str(exc)}
     return {"attempted": True, "ok": True, "soffice": str(soffice)}
+
+
+def _prime_libreoffice_active_document(path: Path) -> dict[str, Any]:
+    """Create LibreOffice's active frame without leaving its document in front."""
+    if sys.platform != "darwin":
+        return {"attempted": False, "ok": None, "reason": "background activation is only implemented on macOS"}
+    target_name = json.dumps(path.name)
+    script = f'''
+tell application "System Events"
+  set priorProcess to first application process whose frontmost is true
+  set priorName to name of priorProcess
+  if not (exists process "soffice") then error "LibreOffice process was not found"
+  tell process "soffice"
+    set targetWindow to first window whose name contains {target_name}
+    try
+      set value of attribute "AXMinimized" of targetWindow to true
+    end try
+  end tell
+end tell
+tell application "LibreOffice" to activate
+delay 0.2
+tell application "System Events"
+  try
+    set frontmost of priorProcess to true
+  end try
+end tell
+return priorName
+'''
+    try:
+        completed = subprocess.run(["osascript"], input=script, capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"attempted": True, "ok": False, "error": str(exc)}
+    return {
+        "attempted": True,
+        "ok": completed.returncode == 0,
+        "method": "osascript minimized-activate-restore",
+        "restored_application": completed.stdout.strip() or None,
+        "stderr": completed.stderr.strip() or None,
+    }
 
 
 def _working_output_path(output_path: Path) -> Path:
@@ -728,19 +770,15 @@ def _warm_up_libreoffice_zotero_connection(path: Path) -> dict[str, Any]:
         return {"attempted": False, "ok": None, "reason": "LibreOffice warmup is only implemented on macOS"}
     target_name = json.dumps(path.name)
     script = f'''
-tell application "LibreOffice" to activate
-delay 0.5
 tell application "System Events"
   set targetName to {target_name}
   if not (exists process "soffice") then error "LibreOffice process was not found"
   tell process "soffice"
-    set frontmost to true
     set targetWindow to missing value
     repeat with w in windows
       try
         if name of w contains targetName then
           set targetWindow to w
-          perform action "AXRaise" of w
           exit repeat
         end if
       end try
@@ -833,42 +871,39 @@ def _save_active_libreoffice_document(path: Path) -> dict[str, Any]:
         return {"attempted": False, "ok": None, "reason": "automatic LibreOffice save is only implemented on macOS"}
     target_name = json.dumps(path.name)
     script = f'''
-tell application "LibreOffice" to activate
-delay 0.5
 tell application "System Events"
   set targetName to {target_name}
-  set foundTarget to false
-  if exists process "soffice" then
-    tell process "soffice"
-      set frontmost to true
-      repeat with w in windows
-        try
-          if name of w contains targetName then
-            perform action "AXRaise" of w
-            set foundTarget to true
+  if not (exists process "soffice") then error "LibreOffice process was not found"
+  tell process "soffice"
+    set targetWindow to missing value
+    repeat with w in windows
+      try
+        if name of w contains targetName then
+          set targetWindow to w
+          exit repeat
+        end if
+      end try
+    end repeat
+    if targetWindow is missing value then error "LibreOffice target document window was not found: " & targetName
+    try
+      set value of attribute "AXMain" of targetWindow to true
+    end try
+    click menu item "Save" of menu 1 of menu bar item "File" of menu bar 1
+    delay 1.0
+    set confirmedWordFormat to false
+    repeat with dialogWindow in windows
+      try
+        repeat with b in buttons of dialogWindow
+          if name of b contains "Word" and name of b contains "Format" then
+            click b
+            set confirmedWordFormat to true
             exit repeat
           end if
-        end try
-      end repeat
-      if foundTarget is false then
-        error "LibreOffice target document window was not found: " & targetName
-      end if
-      delay 0.3
-      keystroke "s" using command down
-    end tell
-  else
-    error "LibreOffice process was not found"
-  end if
-end tell
-delay 1.0
-tell application "System Events"
-  if exists process "soffice" then
-    tell process "soffice"
-      if exists button "Use Word 2007 Format" of window 1 then
-        click button "Use Word 2007 Format" of window 1
-      end if
-    end tell
-  end if
+        end repeat
+      end try
+      if confirmedWordFormat then exit repeat
+    end repeat
+  end tell
 end tell
 '''
     try:
@@ -878,7 +913,7 @@ end tell
     return {
         "attempted": True,
         "ok": completed.returncode == 0,
-        "method": "osascript command-s",
+        "method": "osascript background-menu-save",
         "stderr": completed.stderr.strip() or None,
     }
 

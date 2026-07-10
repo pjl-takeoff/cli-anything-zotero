@@ -723,6 +723,11 @@ class DocxCitationInspectionTests(unittest.TestCase):
                 mock.patch.object(docx_zoterify, "_open_in_libreoffice", return_value={"attempted": True, "ok": True}),
                 mock.patch.object(
                     docx_zoterify,
+                    "_prime_libreoffice_active_document",
+                    return_value={"attempted": True, "ok": True, "method": "test-background-prime"},
+                ) as prime,
+                mock.patch.object(
+                    docx_zoterify,
                     "_warm_up_libreoffice_zotero_connection",
                     return_value={"attempted": True, "ok": True, "method": "test-refresh"},
                 ) as warmup,
@@ -732,7 +737,9 @@ class DocxCitationInspectionTests(unittest.TestCase):
 
         self.assertTrue(payload["ok"])
         self.assertEqual(bridge.calls, 2)
+        prime.assert_called_once_with(output)
         warmup.assert_called_once()
+        self.assertEqual(payload["libreoffice_activation"]["method"], "test-background-prime")
         self.assertEqual(payload["libreoffice_warmup"]["method"], "test-refresh")
         self.assertTrue(payload["has_zotero_fields"])
 
@@ -790,6 +797,70 @@ class DocxCitationInspectionTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertTrue(payload["zotero_startup"]["attempted"])
         self.assertTrue(payload["has_zotero_fields"])
+
+    def test_open_in_libreoffice_does_not_activate_app_on_macos(self):
+        path = Path("/tmp/background.docx")
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(docx_zoterify.sys, "platform", "darwin"),
+            mock.patch.object(docx_zoterify.subprocess, "run", return_value=completed) as run,
+        ):
+            payload = docx_zoterify._open_in_libreoffice(path)
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(run.call_args.args[0], ["open", "-g", "-a", "LibreOffice", str(path)])
+
+    def test_libreoffice_warmup_does_not_raise_or_activate_window(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(docx_zoterify.sys, "platform", "darwin"),
+            mock.patch.object(docx_zoterify.subprocess, "run", return_value=completed) as run,
+        ):
+            payload = docx_zoterify._warm_up_libreoffice_zotero_connection(Path("/tmp/background.docx"))
+
+        script = run.call_args.kwargs["input"]
+        self.assertTrue(payload["ok"])
+        self.assertNotIn("activate", script)
+        self.assertNotIn("frontmost", script)
+        self.assertNotIn("AXRaise", script)
+        self.assertIn('click button "Refresh"', script)
+
+    def test_libreoffice_active_document_prime_minimizes_then_restores_front_app(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="ChatGPT\n", stderr="")
+
+        with (
+            mock.patch.object(docx_zoterify.sys, "platform", "darwin"),
+            mock.patch.object(docx_zoterify.subprocess, "run", return_value=completed) as run,
+        ):
+            payload = docx_zoterify._prime_libreoffice_active_document(Path("/tmp/background.docx"))
+
+        script = run.call_args.kwargs["input"]
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["restored_application"], "ChatGPT")
+        self.assertIn('attribute "AXMinimized"', script)
+        self.assertIn('tell application "LibreOffice" to activate', script)
+        self.assertIn("set frontmost of priorProcess to true", script)
+
+    def test_libreoffice_save_uses_background_menu_and_generic_word_format_button(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(docx_zoterify.sys, "platform", "darwin"),
+            mock.patch.object(docx_zoterify.subprocess, "run", return_value=completed) as run,
+        ):
+            payload = docx_zoterify._save_active_libreoffice_document(Path("/tmp/background.docx"))
+
+        script = run.call_args.kwargs["input"]
+        self.assertTrue(payload["ok"])
+        self.assertNotIn("activate", script)
+        self.assertNotIn("frontmost", script)
+        self.assertNotIn("AXRaise", script)
+        self.assertNotIn("keystroke", script)
+        self.assertIn('menu item "Save"', script)
+        self.assertIn('name of b contains "Word"', script)
+        self.assertIn('name of b contains "Format"', script)
 
     def test_normalize_custom_properties_for_word_preserves_zotero_fields(self):
         with tempfile.TemporaryDirectory() as tmpdir:
