@@ -7,16 +7,28 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
+import time
 import unittest
 import uuid
+import zipfile
 from pathlib import Path
 
-from cli_anything.zotero.core import discovery
+from cli_anything.zotero.core import discovery, docx_zoterify
 from cli_anything.zotero.tests._helpers import sample_pdf_bytes
 from cli_anything.zotero.utils import zotero_paths, zotero_sqlite
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
+LINUX_DOCX_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "linux_dynamic_placeholder.docx"
+
+
+def replace_docx_token(source: Path, output: Path, old: str, new: str) -> None:
+    with zipfile.ZipFile(source) as source_zip, zipfile.ZipFile(output, "w") as output_zip:
+        for info in source_zip.infolist():
+            data = source_zip.read(info.filename)
+            if info.filename == "word/document.xml":
+                data = data.replace(old.encode("utf-8"), new.encode("utf-8"))
+            output_zip.writestr(info, data)
 
 
 def resolve_cli() -> list[str]:
@@ -369,3 +381,69 @@ class ZoteroFullE2E(unittest.TestCase):
         csljson_data = json.loads(csljson.stdout)
         parsed = json.loads(csljson_data["content"])
         self.assertTrue(parsed)
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and os.environ.get("ZOTERO_LINUX_E2E") == "1",
+        "Linux dynamic DOCX E2E disabled",
+    )
+    @unittest.skipUnless(SAMPLE_ITEM is not None, "No regular Zotero item found for Linux DOCX E2E")
+    def test_linux_dynamic_docx_citation_and_bibliography_fields(self):
+        assert SAMPLE_ITEM is not None
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "linux-placeholder.docx"
+            output = Path(tmpdir) / "linux-output.docx"
+            replace_docx_token(LINUX_DOCX_FIXTURE, source, "TESTKEY1", SAMPLE_ITEM["key"])
+
+            conversion = self.run_cli(
+                [
+                    "--json",
+                    "docx",
+                    "insert-citations",
+                    str(source),
+                    "--output",
+                    str(output),
+                    "--style",
+                    "cell",
+                    "--locale",
+                    "en-US",
+                    "--field-type",
+                    "Bookmark",
+                    "--bibliography",
+                    "auto",
+                    "--force",
+                ]
+            )
+            self.assertEqual(conversion.returncode, 0, msg=conversion.stderr)
+
+            inspection = self.run_cli(["--json", "docx", "inspect-citations", str(output), "--sample-limit", "100"])
+            self.assertEqual(inspection.returncode, 0, msg=inspection.stderr)
+            report = json.loads(inspection.stdout)
+            instructions = [field["instruction"] for field in report["fields"]]
+
+            reopen = docx_zoterify._open_in_libreoffice(output)
+            self.assertTrue(reopen.get("ok"), msg=json.dumps(reopen, indent=2))
+            try:
+                time.sleep(3)
+                activation = docx_zoterify._prime_libreoffice_active_document(output)
+                self.assertTrue(activation.get("ok"), msg=json.dumps(activation, indent=2))
+                refresh = docx_zoterify._warm_up_libreoffice_zotero_connection(output)
+                self.assertTrue(refresh.get("ok"), msg=json.dumps(refresh, indent=2))
+                time.sleep(2)
+                save = docx_zoterify._save_active_libreoffice_document(output)
+                self.assertTrue(save.get("ok"), msg=json.dumps(save, indent=2))
+            finally:
+                close = docx_zoterify._close_active_libreoffice_document(output)
+            self.assertTrue(close.get("ok"), msg=json.dumps(close, indent=2))
+
+            refreshed = self.run_cli(["--json", "docx", "inspect-citations", str(output), "--sample-limit", "100"])
+            self.assertEqual(refreshed.returncode, 0, msg=refreshed.stderr)
+            refreshed_report = json.loads(refreshed.stdout)
+            refreshed_instructions = [field["instruction"] for field in refreshed_report["fields"]]
+
+        self.assertTrue(report["has_fields"])
+        self.assertEqual(report["field_counts"].get("zotero"), 2)
+        self.assertEqual(sum("CSL_CITATION" in instruction for instruction in instructions), 1)
+        self.assertEqual(sum("CSL_BIBLIOGRAPHY" in instruction for instruction in instructions), 1)
+        self.assertEqual(refreshed_report["field_counts"].get("zotero"), 2)
+        self.assertEqual(sum("CSL_CITATION" in instruction for instruction in refreshed_instructions), 1)
+        self.assertEqual(sum("CSL_BIBLIOGRAPHY" in instruction for instruction in refreshed_instructions), 1)

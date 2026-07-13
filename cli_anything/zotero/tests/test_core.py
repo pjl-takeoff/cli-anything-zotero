@@ -9,22 +9,14 @@ from pathlib import Path
 from unittest import mock
 from xml.etree import ElementTree as ET
 
-from cli_anything.zotero.core import analysis, catalog, discovery, docx as docx_mod, docx_static, docx_zoterify, experimental, imports as imports_mod, jsbridge, notes as notes_mod, rendering, session as session_mod
-from cli_anything.zotero.tests._helpers import create_sample_environment, fake_zotero_http_server, sample_pdf_bytes
+from cli_anything.zotero.core import analysis, catalog, discovery, docx as docx_mod, docx_static, docx_zoterify, experimental, imports as imports_mod, jsbridge, libreoffice_linux, notes as notes_mod, rendering, session as session_mod
+from cli_anything.zotero.tests._helpers import (
+    create_sample_environment,
+    fake_zotero_http_server,
+    sample_pdf_bytes,
+    write_docx_with_document_xml,
+)
 from cli_anything.zotero.utils import openai_api, zotero_http, zotero_paths, zotero_sqlite
-
-
-def write_docx_with_document_xml(path: Path, body_xml: str) -> None:
-    document_xml = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
-        f"<w:body>{body_xml}</w:body>"
-        "</w:document>"
-    )
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("[Content_Types].xml", '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>')
-        zf.writestr("word/document.xml", document_xml)
-
 
 def write_docx_with_zotero_bookmark_fields(path: Path, *, citation_count: int = 1, bibliography_count: int = 1) -> None:
     paragraphs: list[str] = []
@@ -147,6 +139,107 @@ class PathDiscoveryTests(unittest.TestCase):
             with mock.patch("cli_anything.zotero.utils.zotero_paths.shutil.which", return_value=None):
                 with mock.patch("pathlib.Path.exists", return_value=False):
                     self.assertIsNone(zotero_paths.find_executable(env={}))
+
+    def test_find_executable_discovers_linux_user_local_install(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            executable = home / ".local" / "opt" / "Zotero_linux-x86_64" / "zotero"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("", encoding="utf-8")
+
+            with (
+                mock.patch("cli_anything.zotero.utils.zotero_paths.Path.home", return_value=home),
+                mock.patch("cli_anything.zotero.utils.zotero_paths.shutil.which", return_value=None),
+            ):
+                resolved = zotero_paths.find_executable(env={})
+
+        self.assertEqual(resolved, executable)
+
+    def test_find_executable_resolves_symlink_found_on_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            executable = base / "opt" / "zotero" / "zotero"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("", encoding="utf-8")
+            link = base / "bin" / "zotero"
+            link.parent.mkdir(parents=True)
+            link.symlink_to(executable)
+
+            with mock.patch("cli_anything.zotero.utils.zotero_paths.shutil.which", return_value=str(link)):
+                resolved = zotero_paths.find_executable(env={})
+
+        self.assertEqual(resolved, executable)
+
+    def test_installed_libreoffice_plugin_paths_discovers_linux_user_profile(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            plugin = (
+                home
+                / ".config"
+                / "libreoffice"
+                / "4"
+                / "user"
+                / "uno_packages"
+                / "cache"
+                / "uno_packages"
+                / "linux-test_"
+                / "Zotero_LibreOffice_Integration.oxt"
+            )
+            plugin.mkdir(parents=True)
+
+            with mock.patch("cli_anything.zotero.core.docx.Path.home", return_value=home):
+                installed = docx_mod._installed_libreoffice_plugin_paths()
+
+        self.assertEqual(installed, [plugin])
+
+    def test_bundled_libreoffice_plugin_paths_discovers_linux_zotero_install(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = create_sample_environment(Path(tmpdir))
+            install_dir = env["executable"].parent
+            plugin = install_dir / "integration" / "libreoffice" / "Zotero_LibreOffice_Integration.oxt"
+            plugin.parent.mkdir(parents=True)
+            plugin.write_text("", encoding="utf-8")
+            runtime = discovery.build_runtime_context(
+                backend="sqlite",
+                data_dir=str(env["data_dir"]),
+                profile_dir=str(env["profile_dir"]),
+                executable=str(env["executable"]),
+            )
+
+            bundled = docx_mod._bundled_libreoffice_plugin_paths(runtime)
+
+        self.assertIn(plugin, bundled)
+
+    def test_check_libreoffice_reports_linux_runtime_dependencies(self):
+        dependency_paths = {"Xvfb": "/usr/bin/Xvfb", "xdotool": "/usr/bin/xdotool"}
+        with (
+            mock.patch.object(docx_mod.sys, "platform", "linux"),
+            mock.patch.object(docx_mod, "_find_libreoffice_executable", return_value=Path("/usr/bin/soffice")),
+            mock.patch.object(docx_mod, "_find_libreoffice_python", return_value=Path("/usr/bin/python3")),
+            mock.patch.object(docx_mod, "_python_imports_uno", return_value=True),
+            mock.patch.object(docx_mod.shutil, "which", side_effect=dependency_paths.get),
+        ):
+            result = docx_mod._check_libreoffice()
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["uno_python_checked"])
+        self.assertTrue(result["uno_python_ok"])
+        self.assertEqual(result["xvfb"], "/usr/bin/Xvfb")
+        self.assertEqual(result["xdotool"], "/usr/bin/xdotool")
+        self.assertIn("python3-uno", result["uno_python_note"])
+
+    def test_check_libreoffice_linux_is_not_ready_without_xdotool(self):
+        dependency_paths = {"Xvfb": "/usr/bin/Xvfb", "xdotool": None}
+        with (
+            mock.patch.object(docx_mod.sys, "platform", "linux"),
+            mock.patch.object(docx_mod, "_find_libreoffice_executable", return_value=Path("/usr/bin/soffice")),
+            mock.patch.object(docx_mod, "_find_libreoffice_python", return_value=Path("/usr/bin/python3")),
+            mock.patch.object(docx_mod, "_python_imports_uno", return_value=True),
+            mock.patch.object(docx_mod.shutil, "which", side_effect=dependency_paths.get),
+        ):
+            result = docx_mod._check_libreoffice()
+
+        self.assertFalse(result["ok"])
 
 
 class DocxCitationInspectionTests(unittest.TestCase):
@@ -545,6 +638,74 @@ class DocxCitationInspectionTests(unittest.TestCase):
         self.assertIn("zotero_libreoffice_integration", payload["requirements"])
         self.assertIsNone(payload["probe"])
 
+    def test_zoterify_doctor_is_not_ready_when_runtime_integration_is_unknown(self):
+        class ActiveBridge:
+            port = 23119
+
+            def bridge_endpoint_active(self):
+                return True
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = create_sample_environment(Path(tmpdir))
+            runtime = discovery.build_runtime_context(
+                backend="sqlite",
+                data_dir=str(env["data_dir"]),
+                profile_dir=str(env["profile_dir"]),
+                executable=str(env["executable"]),
+            )
+            with (
+                mock.patch.object(
+                    docx_zoterify,
+                    "zoterify_probe",
+                    return_value={
+                        "ready": False,
+                        "zotero_integration": {"application_instantiable": None, "error": "probe incomplete"},
+                        "libreoffice": {"active_document": False, "error": None},
+                    },
+                ),
+                mock.patch.object(docx_zoterify.docx_tools, "_check_zotero_runtime", return_value={"ok": True}),
+                mock.patch.object(docx_zoterify.docx_tools, "_check_libreoffice", return_value={"ok": True}),
+                mock.patch.object(
+                    docx_zoterify.docx_tools,
+                    "_check_libreoffice_plugin",
+                    return_value={"ok": True, "installed_paths": ["plugin.oxt"], "bundled_paths": ["plugin.oxt"]},
+                ),
+                mock.patch.object(docx_zoterify.zotero_paths, "installed_plugin_version", return_value="1.1.0"),
+                mock.patch.object(docx_zoterify.zotero_paths, "bundled_plugin_version", return_value="1.1.0"),
+                mock.patch.object(docx_zoterify.zotero_paths, "plugin_installed", return_value=True),
+            ):
+                payload = docx_zoterify.zoterify_doctor(runtime, ActiveBridge())
+
+        self.assertFalse(payload["ready"])
+        self.assertFalse(payload["installation_ready"])
+        self.assertFalse(payload["requirements"]["zotero_libreoffice_integration"]["ok"])
+
+    def test_doctor_next_steps_name_missing_linux_desktop_dependency(self):
+        requirements = {
+            "zotero_desktop": {"ok": True},
+            "cli_bridge_plugin": {
+                "xpi_installed": True,
+                "update_available": False,
+                "endpoint_active": True,
+            },
+            "libreoffice": {
+                "ok": False,
+                "soffice": "/usr/bin/soffice",
+                "uno_python_checked": True,
+                "uno_python_ok": True,
+                "xvfb": "/usr/bin/Xvfb",
+                "xdotool": None,
+            },
+            "zotero_libreoffice_integration": {
+                "installed_in_libreoffice": True,
+                "runtime_application_instantiable": True,
+            },
+        }
+
+        steps = docx_zoterify._doctor_next_steps(requirements, installation_ready=False, conversion_probe_ready=False)
+
+        self.assertTrue(any("xdotool" in step for step in steps))
+
     def test_zoterify_document_sends_structured_payload_to_bridge(self):
         class RecordingBridge:
             port = 23119
@@ -723,18 +884,85 @@ class DocxCitationInspectionTests(unittest.TestCase):
                 mock.patch.object(docx_zoterify, "_open_in_libreoffice", return_value={"attempted": True, "ok": True}),
                 mock.patch.object(
                     docx_zoterify,
+                    "_prime_libreoffice_active_document",
+                    return_value={"attempted": True, "ok": True, "method": "test-background-prime"},
+                ) as prime,
+                mock.patch.object(
+                    docx_zoterify,
                     "_warm_up_libreoffice_zotero_connection",
                     return_value={"attempted": True, "ok": True, "method": "test-refresh"},
                 ) as warmup,
                 mock.patch.object(docx_zoterify, "_save_active_libreoffice_document", return_value={"attempted": True, "ok": True}),
+                mock.patch.object(
+                    docx_zoterify,
+                    "_close_active_libreoffice_document",
+                    return_value={"attempted": True, "ok": True},
+                ) as close,
             ):
                 payload = docx_zoterify.zoterify_document(runtime, bridge, source, output, open_document=True)
 
         self.assertTrue(payload["ok"])
         self.assertEqual(bridge.calls, 2)
+        prime.assert_called_once_with(output)
         warmup.assert_called_once()
+        close.assert_called_once_with(output)
+        self.assertEqual(payload["libreoffice_activation"]["method"], "test-background-prime")
         self.assertEqual(payload["libreoffice_warmup"]["method"], "test-refresh")
         self.assertTrue(payload["has_zotero_fields"])
+
+    def test_zoterify_document_stops_before_bridge_when_linux_activation_fails(self):
+        class ActivationBridge:
+            port = 23119
+
+            def __init__(self):
+                self.execute_calls = 0
+
+            def bridge_endpoint_active(self):
+                return True
+
+            def execute_js_http_required(self, code, *, wait_seconds=3):
+                self.execute_calls += 1
+                raise AssertionError("bridge conversion must not run without the target LibreOffice document")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = create_sample_environment(Path(tmpdir))
+            source = Path(tmpdir) / "source.docx"
+            output = Path(tmpdir) / "final.docx"
+            write_docx_with_document_xml(
+                source,
+                '<w:p><w:r><w:t>Known {{zotero:REG12345}}.</w:t></w:r></w:p>',
+            )
+            runtime = discovery.build_runtime_context(
+                backend="sqlite",
+                data_dir=str(env["data_dir"]),
+                profile_dir=str(env["profile_dir"]),
+                executable=str(env["executable"]),
+            )
+            bridge = ActivationBridge()
+
+            with (
+                mock.patch.object(docx_zoterify.sys, "platform", "linux"),
+                mock.patch.object(docx_zoterify, "_working_output_path", return_value=output),
+                mock.patch.object(
+                    docx_zoterify,
+                    "_open_in_libreoffice",
+                    return_value={"attempted": True, "ok": True, "uno_port": 43123},
+                ),
+                mock.patch.object(
+                    docx_zoterify,
+                    "_prime_libreoffice_active_document",
+                    return_value={"attempted": True, "ok": False, "error": "target document not found"},
+                ),
+                mock.patch.object(
+                    docx_zoterify,
+                    "_close_active_libreoffice_document",
+                    return_value={"attempted": True, "ok": True},
+                ),
+                self.assertRaisesRegex(RuntimeError, "activation failed"),
+            ):
+                docx_zoterify.zoterify_document(runtime, bridge, source, output, open_document=True)
+
+        self.assertEqual(bridge.execute_calls, 0)
 
     def test_zoterify_document_launches_zotero_for_bridge_endpoint(self):
         class DelayedBridge:
@@ -790,6 +1018,288 @@ class DocxCitationInspectionTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertTrue(payload["zotero_startup"]["attempted"])
         self.assertTrue(payload["has_zotero_fields"])
+
+    def test_open_in_libreoffice_does_not_activate_app_on_macos(self):
+        path = Path("/tmp/background.docx")
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(docx_zoterify.sys, "platform", "darwin"),
+            mock.patch.object(docx_zoterify.subprocess, "run", return_value=completed) as run,
+        ):
+            payload = docx_zoterify._open_in_libreoffice(path)
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(run.call_args.args[0], ["open", "-g", "-a", "LibreOffice", str(path)])
+
+    def test_linux_open_starts_socket_enabled_libreoffice(self):
+        path = Path("/tmp/linux-background.docx")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile_dir = Path(tmpdir) / "lo-profile"
+            with (
+                mock.patch.object(docx_zoterify.sys, "platform", "linux"),
+                mock.patch.object(
+                    docx_zoterify.docx_tools,
+                    "_find_libreoffice_executable",
+                    return_value=Path("/usr/bin/libreoffice"),
+                ),
+                mock.patch.object(libreoffice_linux, "_allocate_uno_port", return_value=43123),
+                mock.patch.object(libreoffice_linux.tempfile, "mkdtemp", return_value=str(profile_dir)),
+                mock.patch.object(libreoffice_linux.subprocess, "Popen") as popen,
+            ):
+                popen.return_value.pid = 9876
+                payload = docx_zoterify._open_in_libreoffice(path)
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["uno_port"], 43123)
+        self.assertEqual(payload["user_installation"], str(profile_dir))
+        self.assertEqual(
+            popen.call_args.args[0],
+            [
+                "/usr/bin/libreoffice",
+                "--nologo",
+                "--nodefault",
+                "--norestore",
+                "--nolockcheck",
+                f"-env:UserInstallation={profile_dir.resolve().as_uri()}",
+                "--accept=socket,host=127.0.0.1,port=43123;urp;StarOffice.ComponentContext",
+                str(path),
+            ],
+        )
+        popen.return_value.poll.return_value = 0
+        with mock.patch.object(libreoffice_linux.os, "killpg", side_effect=ProcessLookupError):
+            libreoffice_linux.finish_libreoffice_session(path)
+
+    def test_linux_close_cleans_up_isolated_libreoffice_session(self):
+        path = Path("/tmp/linux-background.docx")
+        cleanup = {"attempted": True, "ok": True, "process_exited": True, "profile_removed": True}
+
+        with (
+            mock.patch.object(docx_zoterify.sys, "platform", "linux"),
+            mock.patch.object(
+                libreoffice_linux,
+                "run_uno_operation",
+                return_value={"attempted": True, "ok": True, "method": "uno close"},
+            ) as run_uno,
+            mock.patch.object(libreoffice_linux, "finish_libreoffice_session", return_value=cleanup) as finish,
+        ):
+            payload = docx_zoterify._close_active_libreoffice_document(path)
+
+        run_uno.assert_called_once_with("close", path)
+        finish.assert_called_once_with(path)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["session_cleanup"], cleanup)
+
+    def test_linux_session_cleanup_waits_for_entire_process_group(self):
+        path = Path("/tmp/linux-process-group.docx")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile_dir = Path(tmpdir) / "profile"
+            profile_dir.mkdir()
+            process = mock.Mock()
+            process.pid = 4321
+            process.poll.return_value = 0
+            session = libreoffice_linux.LibreOfficeSession(
+                path=path.resolve(),
+                port=43123,
+                profile_dir=profile_dir,
+                process=process,
+            )
+            with libreoffice_linux._SESSIONS_LOCK:
+                libreoffice_linux._SESSIONS[path.resolve()] = session
+
+            with (
+                mock.patch.object(libreoffice_linux, "_process_group_exists", return_value=True),
+                mock.patch.object(
+                    libreoffice_linux,
+                    "_wait_for_process_group_exit",
+                    side_effect=[False, True],
+                ) as wait_group,
+                mock.patch.object(libreoffice_linux.os, "killpg") as killpg,
+            ):
+                cleanup = libreoffice_linux.finish_libreoffice_session(path, timeout=0.01)
+
+        self.assertTrue(cleanup["ok"])
+        self.assertTrue(cleanup["process_group_exited"])
+        self.assertEqual(wait_group.call_count, 2)
+        self.assertEqual(
+            killpg.call_args_list,
+            [mock.call(4321, libreoffice_linux.signal.SIGTERM), mock.call(4321, libreoffice_linux.signal.SIGKILL)],
+        )
+
+    def test_linux_prime_waits_for_target_document_through_uno(self):
+        path = Path("/tmp/linux-background.docx")
+
+        with (
+            mock.patch.object(docx_zoterify.sys, "platform", "linux"),
+            mock.patch.object(
+                libreoffice_linux,
+                "run_uno_operation",
+                return_value={"attempted": True, "ok": True, "method": "uno wait"},
+            ) as run_uno,
+        ):
+            payload = docx_zoterify._prime_libreoffice_active_document(path)
+
+        run_uno.assert_called_once_with("wait", path)
+        self.assertTrue(payload["attempted"])
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["method"], "uno wait")
+
+    def test_linux_save_persists_target_document_through_uno(self):
+        path = Path("/tmp/linux-background.docx")
+
+        with (
+            mock.patch.object(docx_zoterify.sys, "platform", "linux"),
+            mock.patch.object(
+                libreoffice_linux,
+                "run_uno_operation",
+                return_value={"attempted": True, "ok": True, "method": "uno store"},
+            ) as run_uno,
+        ):
+            payload = docx_zoterify._save_active_libreoffice_document(path)
+
+        run_uno.assert_called_once_with("store", path)
+        self.assertTrue(payload["attempted"])
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["method"], "uno store")
+
+    def test_linux_close_closes_target_document_through_uno(self):
+        path = Path("/tmp/linux-background.docx")
+
+        with (
+            mock.patch.object(docx_zoterify.sys, "platform", "linux"),
+            mock.patch.object(
+                libreoffice_linux,
+                "run_uno_operation",
+                return_value={"attempted": True, "ok": True, "method": "uno close"},
+            ) as run_uno,
+        ):
+            payload = docx_zoterify._close_active_libreoffice_document(path)
+
+        run_uno.assert_called_once_with("close", path)
+        self.assertTrue(payload["attempted"])
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["method"], "uno close")
+
+    def test_linux_warmup_dispatches_zotero_refresh_through_uno(self):
+        path = Path("/tmp/linux-background.docx")
+
+        with (
+            mock.patch.object(docx_zoterify.sys, "platform", "linux"),
+            mock.patch.object(
+                libreoffice_linux,
+                "run_uno_operation",
+                return_value={"attempted": True, "ok": True, "method": "uno refresh"},
+            ) as run_uno,
+        ):
+            payload = docx_zoterify._warm_up_libreoffice_zotero_connection(path)
+
+        run_uno.assert_called_once_with("refresh", path)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["method"], "uno refresh")
+
+    def test_linux_uno_operation_reports_invalid_helper_json(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="not-json", stderr="")
+
+        with mock.patch.object(libreoffice_linux.subprocess, "run", return_value=completed):
+            payload = libreoffice_linux.run_uno_operation("store", Path("/tmp/linux-background.docx"))
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "UNO helper returned invalid JSON")
+
+    def test_linux_refresh_dismisses_zotero_integration_dialog(self):
+        helper = subprocess.CompletedProcess([], 0, stdout='{"ok": true}', stderr="")
+        search = subprocess.CompletedProcess([], 0, stdout="123\n", stderr="")
+        dismiss = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+        with mock.patch.object(
+            libreoffice_linux.subprocess,
+            "run",
+            side_effect=[helper, search, dismiss],
+        ) as run:
+            payload = libreoffice_linux.run_uno_operation("refresh", Path("/tmp/linux-background.docx"))
+
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["dialog"]["ok"])
+        self.assertEqual(run.call_args_list[1].args[0], ["xdotool", "search", "--name", "Zotero Integration"])
+        self.assertEqual(run.call_args_list[2].args[0], ["xdotool", "windowfocus", "123", "key", "Return"])
+
+    def test_linux_refresh_fails_when_dialog_cannot_be_dismissed(self):
+        helper = subprocess.CompletedProcess([], 0, stdout='{"ok": true}', stderr="")
+        search = subprocess.CompletedProcess([], 0, stdout="123\n", stderr="")
+        dismiss = subprocess.CompletedProcess([], 1, stdout="", stderr="focus failed")
+
+        with mock.patch.object(
+            libreoffice_linux.subprocess,
+            "run",
+            side_effect=[helper, search, dismiss],
+        ):
+            payload = libreoffice_linux.run_uno_operation("refresh", Path("/tmp/linux-background.docx"))
+
+        self.assertFalse(payload["ok"])
+        self.assertIn("focus failed", payload["error"])
+
+    def test_closed_libreoffice_stream_requires_connection_warmup(self):
+        bridge_result = {
+            "ok": True,
+            "data": {
+                "error": "Component returned failure code: 0x80470002 (NS_BASE_STREAM_CLOSED) "
+                "[nsIBinaryOutputStream.write32]"
+            },
+        }
+
+        self.assertTrue(docx_zoterify._needs_libreoffice_connection_warmup(bridge_result))
+
+    def test_libreoffice_warmup_does_not_raise_or_activate_window(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(docx_zoterify.sys, "platform", "darwin"),
+            mock.patch.object(docx_zoterify.subprocess, "run", return_value=completed) as run,
+        ):
+            payload = docx_zoterify._warm_up_libreoffice_zotero_connection(Path("/tmp/background.docx"))
+
+        script = run.call_args.kwargs["input"]
+        self.assertTrue(payload["ok"])
+        self.assertNotIn("activate", script)
+        self.assertNotIn("frontmost", script)
+        self.assertNotIn("AXRaise", script)
+        self.assertIn('click button "Refresh"', script)
+
+    def test_libreoffice_active_document_prime_minimizes_then_restores_front_app(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="ChatGPT\n", stderr="")
+
+        with (
+            mock.patch.object(docx_zoterify.sys, "platform", "darwin"),
+            mock.patch.object(docx_zoterify.subprocess, "run", return_value=completed) as run,
+        ):
+            payload = docx_zoterify._prime_libreoffice_active_document(Path("/tmp/background.docx"))
+
+        script = run.call_args.kwargs["input"]
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["restored_application"], "ChatGPT")
+        self.assertIn('attribute "AXMinimized"', script)
+        self.assertIn('tell application "LibreOffice" to activate', script)
+        self.assertIn("set frontmost of priorProcess to true", script)
+
+    def test_libreoffice_save_uses_background_menu_and_generic_word_format_button(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(docx_zoterify.sys, "platform", "darwin"),
+            mock.patch.object(docx_zoterify.subprocess, "run", return_value=completed) as run,
+        ):
+            payload = docx_zoterify._save_active_libreoffice_document(Path("/tmp/background.docx"))
+
+        script = run.call_args.kwargs["input"]
+        self.assertTrue(payload["ok"])
+        self.assertNotIn("activate", script)
+        self.assertNotIn("frontmost", script)
+        self.assertNotIn("AXRaise", script)
+        self.assertNotIn("keystroke", script)
+        self.assertIn('menu item "Save"', script)
+        self.assertIn('name of b contains "Word"', script)
+        self.assertIn('name of b contains "Format"', script)
 
     def test_normalize_custom_properties_for_word_preserves_zotero_fields(self):
         with tempfile.TemporaryDirectory() as tmpdir:

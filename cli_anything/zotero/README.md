@@ -29,8 +29,9 @@ This harness is designed for practical daily Zotero workflows:
 - Zotero desktop installed
 - a local Zotero profile and data directory
 - Optional dynamic DOCX citations: LibreOffice, the Zotero LibreOffice Add-in,
-  and the CLI Bridge plugin. macOS is tested end-to-end; Windows/Linux need
-  real desktop validation for fully automatic LibreOffice open/save.
+  and the CLI Bridge plugin. macOS and Ubuntu 24.04 under Xvfb are tested
+  end-to-end; Windows still needs real desktop validation for automatic
+  LibreOffice open/save.
 
 The Windows-first validation target for this harness is:
 
@@ -70,6 +71,65 @@ user_pref("extensions.zotero.httpServer.localAPI.enabled", true);
 ```
 
 Then restart Zotero.
+
+## Linux Dynamic DOCX Setup
+
+Ubuntu 24.04 requires a real LibreOffice GUI session inside an isolated Xvfb
+display. The CLI uses UNO for deterministic save/close operations and xdotool
+only to dismiss the Zotero Integration refresh dialog inside that isolated
+display. Each conversion copies the verified LibreOffice user profile into a
+temporary profile, allocates a separate UNO port, then terminates the process
+and removes the temporary profile after the document is saved.
+
+Install the runtime dependencies:
+
+```bash
+sudo apt-get install libreoffice-writer libreoffice-java-common python3-uno \
+  default-jre xvfb xauth xdotool
+```
+
+Install Zotero Desktop, then make its executable discoverable through `PATH`,
+`ZOTERO_EXECUTABLE`, or a standard user-local location such as
+`~/.local/opt/Zotero_linux-x86_64/zotero`. Install both integrations once:
+
+```bash
+zotero-cli app install-plugin
+unopkg add --force "$(dirname "$(readlink -f "$(command -v zotero)")")/integration/libreoffice/Zotero_LibreOffice_Integration.oxt"
+```
+
+Restart Zotero after installing the CLI Bridge. Fresh Zotero 9 profiles may
+register a side-loaded extension as disabled on first launch; enable the CLI
+Bridge once in Zotero's Add-ons Manager, restart Zotero, and require
+`plugin-status` to report `ready: true`.
+
+For an SSH/server session, keep Zotero in a persistent isolated display:
+
+```bash
+systemd-run --user --unit=zotero-linux --collect \
+  xvfb-run -a zotero
+zotero-cli --json app plugin-status
+zotero-cli --json docx doctor
+```
+
+In `docx doctor` output, top-level `ready` means the installation is ready for
+an automatic conversion. `conversion_probe_ready` is the stricter live-document
+probe and remains false until a DOCX is already open in LibreOffice.
+
+Run each DOCX conversion in its own Xvfb-owned unit so LibreOffice and its
+display are cleaned up together:
+
+```bash
+systemd-run --user --unit=zotero-docx-convert --collect --wait --pipe \
+  --working-directory="$PWD" \
+  xvfb-run -a zotero-cli --json docx insert-citations manuscript.docx \
+    --output manuscript-zotero.docx --style cell --bibliography auto --force
+
+zotero-cli --json docx inspect-citations manuscript-zotero.docx --sample-limit 100
+```
+
+The final inspection must report the expected Zotero citation and bibliography
+field counts. Do not replace a failed dynamic conversion with static citation
+text unless the caller explicitly selects the static workflow.
 
 ## Quickstart
 

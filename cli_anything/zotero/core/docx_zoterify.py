@@ -13,6 +13,7 @@ from xml.etree import ElementTree as ET
 
 from cli_anything.zotero.core import docx as docx_tools
 from cli_anything.zotero.core import discovery
+from cli_anything.zotero.core import libreoffice_linux
 from cli_anything.zotero.core.discovery import RuntimeContext
 from cli_anything.zotero.utils import zotero_paths
 
@@ -170,7 +171,7 @@ def zoterify_doctor(runtime: RuntimeContext, bridge: Any, *, backend: str = DEFA
         },
         "libreoffice": libreoffice_check,
         "zotero_libreoffice_integration": {
-            "ok": bool(libreoffice_plugin_check["ok"] and runtime_integration_ok is not False),
+            "ok": bool(libreoffice_plugin_check["ok"] and runtime_integration_ok is True),
             "installed_in_libreoffice": bool(libreoffice_plugin_check["ok"]),
             "installed_paths": libreoffice_plugin_check["installed_paths"],
             "bundled_paths": libreoffice_plugin_check["bundled_paths"],
@@ -241,10 +242,17 @@ def zoterify_document(
     if debug_path is not None:
         _write_debug_json(debug_path / "01-placeholder-map.json", working)
     output_path = Path(working["output"])
+    open_result = {"attempted": False, "ok": None}
+    close_result = {"attempted": False, "ok": None}
     try:
         open_result = _open_in_libreoffice(output_path) if open_document else {"attempted": False, "ok": None}
+        activation_result = {"attempted": False, "ok": None}
         if open_result.get("ok"):
             time.sleep(3)
+            activation_result = _prime_libreoffice_active_document(output_path)
+            if sys.platform.startswith("linux") and activation_result.get("ok") is not True:
+                detail = activation_result.get("error") or activation_result.get("reason") or "target document unavailable"
+                raise RuntimeError(f"LibreOffice target document activation failed: {detail}")
         zoterify_js = _zoterify_js(
             placeholders=working["placeholders"],
             bibliography_placeholder=working["bibliography_placeholder"],
@@ -259,9 +267,11 @@ def zoterify_document(
             warmup_result = _warm_up_libreoffice_zotero_connection(output_path)
             if debug_path is not None:
                 _write_debug_json(debug_path / "02-libreoffice-warmup.json", warmup_result)
-            if warmup_result.get("ok"):
-                time.sleep(1)
-                bridge_result = bridge.execute_js_http_required(zoterify_js, wait_seconds=60)
+            if warmup_result.get("ok") is not True:
+                detail = warmup_result.get("error") or warmup_result.get("reason") or "refresh did not complete"
+                raise RuntimeError(f"LibreOffice Zotero connection warmup failed: {detail}")
+            time.sleep(1)
+            bridge_result = bridge.execute_js_http_required(zoterify_js, wait_seconds=60)
         if not bridge_result.get("ok"):
             raise RuntimeError(f"Zotero LibreOffice conversion failed: {bridge_result.get('error')}")
 
@@ -293,6 +303,12 @@ def zoterify_document(
                 f"citation_fields={zotero_counts['citation']} bibliography_fields={zotero_counts['bibliography']}. "
                 "Close any existing LibreOffice window for this output file, or choose a new --output path, then rerun the same command."
             )
+        if open_result.get("ok") and sys.platform.startswith("linux"):
+            close_result = _close_active_libreoffice_document(output_path)
+            if close_result.get("ok") is not True:
+                detail = close_result.get("error") or "isolated LibreOffice session did not close cleanly"
+                raise RuntimeError(f"LibreOffice cleanup failed: {detail}")
+            time.sleep(0.5)
         _normalize_custom_properties_for_word(output_path)
         if output_path != final_output_path:
             output_path.replace(final_output_path)
@@ -300,6 +316,8 @@ def zoterify_document(
             inspection = docx_tools.inspect_citations(output_path, sample_limit=10000)
             zotero_counts = _zotero_field_type_counts(inspection)
     except Exception:
+        if open_result.get("ok") and sys.platform.startswith("linux") and not close_result.get("attempted"):
+            close_result = _close_active_libreoffice_document(output_path)
         if output_path != final_output_path and debug_path is None:
             try:
                 output_path.unlink()
@@ -324,8 +342,10 @@ def zoterify_document(
         "has_zotero_fields": bool(inspection["field_counts"].get("zotero")),
         "saved": bool(save_result.get("ok")),
         "save": save_result,
+        "close": close_result,
         "ready_for_user": ready_for_user,
         "open": open_result,
+        "libreoffice_activation": activation_result,
         "zotero_startup": zotero_startup,
         "libreoffice_warmup": warmup_result,
         "bridge": bridge_payload,
@@ -665,19 +685,80 @@ def _normalize_probe_payload(data: dict[str, Any], *, bridge: Any, backend: str)
 def _open_in_libreoffice(path: Path) -> dict[str, Any]:
     if sys.platform == "darwin":
         try:
-            subprocess.run(["open", "-a", "LibreOffice", str(path)], capture_output=True, text=True, timeout=10, check=False)
+            subprocess.run(["open", "-g", "-a", "LibreOffice", str(path)], capture_output=True, text=True, timeout=10, check=False)
         except (OSError, subprocess.TimeoutExpired) as exc:
             return {"attempted": True, "ok": False, "error": str(exc)}
-        return {"attempted": True, "ok": True, "method": "open -a LibreOffice"}
+        return {"attempted": True, "ok": True, "method": "open -g -a LibreOffice"}
 
     soffice = docx_tools._find_libreoffice_executable()
     if soffice is None:
         return {"attempted": True, "ok": False, "error": "LibreOffice executable was not found."}
+    if sys.platform.startswith("linux"):
+        try:
+            session = libreoffice_linux.start_libreoffice_session(soffice, path)
+        except (OSError, RuntimeError) as exc:
+            return {"attempted": True, "ok": False, "soffice": str(soffice), "error": str(exc)}
+        return {
+            "attempted": True,
+            "ok": True,
+            "soffice": str(soffice),
+            "uno_port": session.port,
+            "user_installation": str(session.profile_dir),
+            "pid": session.process.pid,
+        }
+    else:
+        command = [str(soffice), str(path)]
     try:
-        subprocess.Popen([str(soffice), str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as exc:
         return {"attempted": True, "ok": False, "soffice": str(soffice), "error": str(exc)}
-    return {"attempted": True, "ok": True, "soffice": str(soffice)}
+    return {
+        "attempted": True,
+        "ok": True,
+        "soffice": str(soffice),
+        "uno_port": libreoffice_linux.DEFAULT_UNO_PORT if sys.platform.startswith("linux") else None,
+    }
+
+
+def _prime_libreoffice_active_document(path: Path) -> dict[str, Any]:
+    """Create LibreOffice's active frame without leaving its document in front."""
+    if sys.platform.startswith("linux"):
+        return libreoffice_linux.run_uno_operation("wait", path)
+    if sys.platform != "darwin":
+        return {"attempted": False, "ok": None, "reason": "background activation is only implemented on macOS"}
+    target_name = json.dumps(path.name)
+    script = f'''
+tell application "System Events"
+  set priorProcess to first application process whose frontmost is true
+  set priorName to name of priorProcess
+  if not (exists process "soffice") then error "LibreOffice process was not found"
+  tell process "soffice"
+    set targetWindow to first window whose name contains {target_name}
+    try
+      set value of attribute "AXMinimized" of targetWindow to true
+    end try
+  end tell
+end tell
+tell application "LibreOffice" to activate
+delay 0.2
+tell application "System Events"
+  try
+    set frontmost of priorProcess to true
+  end try
+end tell
+return priorName
+'''
+    try:
+        completed = subprocess.run(["osascript"], input=script, capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"attempted": True, "ok": False, "error": str(exc)}
+    return {
+        "attempted": True,
+        "ok": completed.returncode == 0,
+        "method": "osascript minimized-activate-restore",
+        "restored_application": completed.stdout.strip() or None,
+        "stderr": completed.stderr.strip() or None,
+    }
 
 
 def _working_output_path(output_path: Path) -> Path:
@@ -719,28 +800,34 @@ def _needs_libreoffice_connection_warmup(bridge_result: dict[str, Any]) -> bool:
         if data_error:
             messages.append(str(data_error))
     text = "\n".join(messages)
-    return "_lastDataListener" in text or "beginTransaction" in text
+    return any(
+        marker in text
+        for marker in (
+            "_lastDataListener",
+            "beginTransaction",
+            "NS_BASE_STREAM_CLOSED",
+            "nsIBinaryOutputStream",
+        )
+    )
 
 
 def _warm_up_libreoffice_zotero_connection(path: Path) -> dict[str, Any]:
     """Click LibreOffice's Zotero Refresh button once to initialize the Zotero socket."""
+    if sys.platform.startswith("linux"):
+        return libreoffice_linux.run_uno_operation("refresh", path)
     if sys.platform != "darwin":
         return {"attempted": False, "ok": None, "reason": "LibreOffice warmup is only implemented on macOS"}
     target_name = json.dumps(path.name)
     script = f'''
-tell application "LibreOffice" to activate
-delay 0.5
 tell application "System Events"
   set targetName to {target_name}
   if not (exists process "soffice") then error "LibreOffice process was not found"
   tell process "soffice"
-    set frontmost to true
     set targetWindow to missing value
     repeat with w in windows
       try
         if name of w contains targetName then
           set targetWindow to w
-          perform action "AXRaise" of w
           exit repeat
         end if
       end try
@@ -829,46 +916,45 @@ def _friendly_conversion_error(error: str, output_path: Path) -> str:
 
 
 def _save_active_libreoffice_document(path: Path) -> dict[str, Any]:
+    if sys.platform.startswith("linux"):
+        return libreoffice_linux.run_uno_operation("store", path)
     if sys.platform != "darwin":
         return {"attempted": False, "ok": None, "reason": "automatic LibreOffice save is only implemented on macOS"}
     target_name = json.dumps(path.name)
     script = f'''
-tell application "LibreOffice" to activate
-delay 0.5
 tell application "System Events"
   set targetName to {target_name}
-  set foundTarget to false
-  if exists process "soffice" then
-    tell process "soffice"
-      set frontmost to true
-      repeat with w in windows
-        try
-          if name of w contains targetName then
-            perform action "AXRaise" of w
-            set foundTarget to true
+  if not (exists process "soffice") then error "LibreOffice process was not found"
+  tell process "soffice"
+    set targetWindow to missing value
+    repeat with w in windows
+      try
+        if name of w contains targetName then
+          set targetWindow to w
+          exit repeat
+        end if
+      end try
+    end repeat
+    if targetWindow is missing value then error "LibreOffice target document window was not found: " & targetName
+    try
+      set value of attribute "AXMain" of targetWindow to true
+    end try
+    click menu item "Save" of menu 1 of menu bar item "File" of menu bar 1
+    delay 1.0
+    set confirmedWordFormat to false
+    repeat with dialogWindow in windows
+      try
+        repeat with b in buttons of dialogWindow
+          if name of b contains "Word" and name of b contains "Format" then
+            click b
+            set confirmedWordFormat to true
             exit repeat
           end if
-        end try
-      end repeat
-      if foundTarget is false then
-        error "LibreOffice target document window was not found: " & targetName
-      end if
-      delay 0.3
-      keystroke "s" using command down
-    end tell
-  else
-    error "LibreOffice process was not found"
-  end if
-end tell
-delay 1.0
-tell application "System Events"
-  if exists process "soffice" then
-    tell process "soffice"
-      if exists button "Use Word 2007 Format" of window 1 then
-        click button "Use Word 2007 Format" of window 1
-      end if
-    end tell
-  end if
+        end repeat
+      end try
+      if confirmedWordFormat then exit repeat
+    end repeat
+  end tell
 end tell
 '''
     try:
@@ -878,9 +964,21 @@ end tell
     return {
         "attempted": True,
         "ok": completed.returncode == 0,
-        "method": "osascript command-s",
+        "method": "osascript background-menu-save",
         "stderr": completed.stderr.strip() or None,
     }
+
+
+def _close_active_libreoffice_document(path: Path) -> dict[str, Any]:
+    if sys.platform.startswith("linux"):
+        result = libreoffice_linux.run_uno_operation("close", path)
+        cleanup = libreoffice_linux.finish_libreoffice_session(path)
+        result["session_cleanup"] = cleanup
+        if cleanup.get("attempted") and cleanup.get("ok") is not True:
+            result["ok"] = False
+            result["error"] = result.get("error") or "Isolated LibreOffice process or profile cleanup failed."
+        return result
+    return {"attempted": False, "ok": None, "reason": "automatic close is only required by the Linux isolated-display workflow"}
 
 
 def _zoterify_notes(inspection: dict[str, Any]) -> list[str]:
@@ -914,8 +1012,23 @@ def _doctor_next_steps(requirements: dict[str, Any], installation_ready: bool, c
         steps.append("Restart Zotero, then run: zotero-cli app plugin-status")
     elif not bridge["endpoint_active"]:
         steps.append("Restart Zotero. If the bridge is still inactive, rerun: zotero-cli app install-plugin")
-    if not requirements["libreoffice"]["ok"]:
-        steps.append("Install LibreOffice, then reopen Zotero and LibreOffice.")
+    libreoffice = requirements["libreoffice"]
+    if not libreoffice["ok"]:
+        dependency_step_added = False
+        if not libreoffice.get("soffice"):
+            steps.append("Install LibreOffice, then reopen Zotero and LibreOffice.")
+            dependency_step_added = True
+        if libreoffice.get("uno_python_checked") and not libreoffice.get("uno_python_ok"):
+            steps.append("Install the Linux UNO binding: sudo apt-get install python3-uno")
+            dependency_step_added = True
+        if "xvfb" in libreoffice and not libreoffice.get("xvfb"):
+            steps.append("Install the isolated Linux display runtime: sudo apt-get install xvfb xauth")
+            dependency_step_added = True
+        if "xdotool" in libreoffice and not libreoffice.get("xdotool"):
+            steps.append("Install Linux dialog control for the isolated display: sudo apt-get install xdotool")
+            dependency_step_added = True
+        if not dependency_step_added:
+            steps.append("Repair the LibreOffice runtime, then rerun: zotero-cli docx doctor")
     integration = requirements["zotero_libreoffice_integration"]
     if not integration["installed_in_libreoffice"]:
         steps.append("In Zotero, open Settings/Preferences > Cite > Word Processors, then install the LibreOffice Add-in.")

@@ -185,18 +185,24 @@ def find_executable(explicit_executable: str | None = None, env: Mapping[str, st
     for name in ("zotero", "zotero.exe"):
         path = shutil.which(name)
         if path:
-            return Path(path)
+            candidate = Path(path)
+            return candidate.resolve() if candidate.is_symlink() else candidate
 
+    home = Path.home()
     candidates = [
         Path(r"C:\Program Files\Zotero\zotero.exe"),
         Path(r"C:\Program Files (x86)\Zotero\zotero.exe"),
         Path("/Applications/Zotero.app/Contents/MacOS/zotero"),
+        home / ".local" / "opt" / "Zotero_linux-x86_64" / "zotero",
+        home / ".local" / "share" / "zotero" / "zotero",
+        home / ".local" / "bin" / "zotero",
+        Path("/opt/zotero/zotero"),
         Path("/usr/lib/zotero/zotero"),
         Path("/usr/local/bin/zotero"),
     ]
     for candidate in candidates:
         if candidate.exists():
-            return candidate
+            return candidate.resolve() if candidate.is_symlink() else candidate
     return None
 
 

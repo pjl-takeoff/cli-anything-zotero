@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import uuid
 import zipfile
 from collections import Counter
@@ -534,12 +535,29 @@ def _java_home() -> str | None:
 def _check_libreoffice() -> dict[str, Any]:
     soffice = _find_libreoffice_executable()
     uno_python = _find_libreoffice_python(soffice)
+    if sys.platform.startswith("linux"):
+        uno_python_ok = _python_imports_uno(uno_python)
+        xvfb = shutil.which("Xvfb")
+        xdotool = shutil.which("xdotool")
+        return {
+            "ok": bool(soffice and soffice.exists() and uno_python_ok and xvfb and xdotool),
+            "soffice": str(soffice) if soffice else None,
+            "python": str(uno_python) if uno_python else None,
+            "uno_python_checked": True,
+            "uno_python_ok": uno_python_ok,
+            "uno_python_note": "Linux dynamic DOCX conversion requires system python3-uno for UNO document control.",
+            "xvfb": xvfb,
+            "xdotool": xdotool,
+        }
     return {
         "ok": bool(soffice and soffice.exists()),
         "soffice": str(soffice) if soffice else None,
         "python": str(uno_python) if uno_python else None,
         "uno_python_checked": False,
+        "uno_python_ok": None,
         "uno_python_note": "Skipped because launching LibreOfficePython can crash on some macOS LibreOffice builds and is not required for Zotero plugin import.",
+        "xvfb": None,
+        "xdotool": None,
     }
 
 
@@ -558,6 +576,11 @@ def _find_libreoffice_executable() -> Path | None:
 
 def _find_libreoffice_python(soffice: Path | None) -> Path | None:
     candidates: list[Path] = []
+    if sys.platform.startswith("linux"):
+        candidates.append(Path("/usr/bin/python3"))
+        resolved = shutil.which("python3")
+        if resolved:
+            candidates.append(Path(resolved))
     if soffice is not None:
         app_bundle = _containing_app_bundle(soffice)
         if app_bundle is not None:
@@ -567,6 +590,22 @@ def _find_libreoffice_python(soffice: Path | None) -> Path | None:
         if candidate.exists():
             return candidate
     return None
+
+
+def _python_imports_uno(python: Path | None) -> bool:
+    if python is None or not python.exists():
+        return False
+    try:
+        result = subprocess.run(
+            [str(python), "-c", "import uno"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
 
 
 def _containing_app_bundle(path: Path) -> Path | None:
@@ -601,16 +640,25 @@ def _check_libreoffice_plugin(runtime: RuntimeContext) -> dict[str, Any]:
 
 
 def _installed_libreoffice_plugin_paths() -> list[Path]:
-    base = Path.home() / "Library" / "Application Support" / "LibreOffice" / "4" / "user" / "uno_packages" / "cache" / "uno_packages"
-    if not base.exists():
-        return []
-    return sorted(path for path in base.glob("*/Zotero_LibreOffice_Integration.oxt") if path.exists())
+    home = Path.home()
+    bases = [
+        home / "Library" / "Application Support" / "LibreOffice" / "4" / "user" / "uno_packages" / "cache" / "uno_packages",
+        home / ".config" / "libreoffice" / "4" / "user" / "uno_packages" / "cache" / "uno_packages",
+    ]
+    return sorted(
+        path
+        for base in bases
+        if base.exists()
+        for path in base.glob("*/Zotero_LibreOffice_Integration.oxt")
+        if path.exists()
+    )
 
 
 def _bundled_libreoffice_plugin_paths(runtime: RuntimeContext) -> list[Path]:
     candidates: list[Path] = [Path("/Applications/Zotero.app/Contents/Resources/integration/libreoffice/Zotero_LibreOffice_Integration.oxt")]
     install_dir = runtime.environment.install_dir
     if install_dir is not None:
+        candidates.append(install_dir / "integration" / "libreoffice" / "Zotero_LibreOffice_Integration.oxt")
         candidates.append(install_dir.parent / "Resources" / "integration" / "libreoffice" / "Zotero_LibreOffice_Integration.oxt")
     return _dedupe_paths(path for path in candidates if path.exists())
 
