@@ -1698,6 +1698,22 @@ class HttpUtilityTests(unittest.TestCase):
 
 
 class ImportCoreTests(unittest.TestCase):
+    def test_import_doi_if_missing_checks_existing_item_before_translation(self):
+        client = jsbridge.JSBridgeClient(port=23119)
+        with mock.patch.object(
+            client,
+            "execute_js",
+            return_value={"ok": True, "data": {"status": "existing", "key": "REG12345"}, "error": None},
+        ) as execute_js:
+            result = client.import_from_doi("10.1000/sample", if_missing=True)
+
+        self.assertEqual(result["data"]["key"], "REG12345")
+        javascript = execute_js.call_args.args[0]
+        self.assertIn("addCondition('DOI', 'is', '10.1000/sample')", javascript)
+        self.assertLess(javascript.index("addCondition('DOI'"), javascript.index("new Zotero.Translate.Search()"))
+        self.assertIn("status: 'existing'", javascript)
+        self.assertIn("status: 'imported'", javascript)
+
     def setUp(self) -> None:
         self.tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmpdir.cleanup)

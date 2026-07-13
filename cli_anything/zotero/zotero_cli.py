@@ -1681,10 +1681,22 @@ def import_json_command(
 @click.argument("doi")
 @click.option("--collection", "collection_key", default=None, help="Collection key to add the imported item to.")
 @click.option("--tag", "tags", multiple=True, help="Tag to apply after import. Repeatable.")
+@click.option("--if-missing", is_flag=True, help="Return an existing DOI match instead of importing a duplicate.")
 @click.pass_context
-def import_doi_command(ctx: click.Context, doi: str, collection_key: str | None, tags: tuple[str, ...]) -> int:
+def import_doi_command(
+    ctx: click.Context,
+    doi: str,
+    collection_key: str | None,
+    tags: tuple[str, ...],
+    if_missing: bool,
+) -> int:
     """Import an item by DOI using Zotero's built-in translator (via JS bridge)."""
-    result = current_bridge(ctx).import_from_doi(doi, collection_key=collection_key, tags=list(tags) if tags else None)
+    result = current_bridge(ctx).import_from_doi(
+        doi,
+        collection_key=collection_key,
+        tags=list(tags) if tags else None,
+        if_missing=if_missing,
+    )
     return emit_js(ctx, result)
 
 

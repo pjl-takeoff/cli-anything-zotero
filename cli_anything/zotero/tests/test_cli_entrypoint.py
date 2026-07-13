@@ -75,6 +75,12 @@ class CliEntrypointTests(unittest.TestCase):
         self.assertIn("note", result.stdout)
         self.assertIn("session", result.stdout)
 
+    def test_import_doi_exposes_idempotent_if_missing_option(self):
+        result = self.run_cli(["import", "doi", "--help"])
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("--if-missing", result.stdout)
+
     def test_version_option_reports_package_version(self):
         result = self.run_cli(["--version"])
         self.assertEqual(result.returncode, 0, msg=result.stderr)

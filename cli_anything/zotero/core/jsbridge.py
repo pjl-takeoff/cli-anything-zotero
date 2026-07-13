@@ -419,10 +419,42 @@ class JSBridgeClient:
             parts.append("await item.saveTx();")
         return " ".join(parts)
 
-    def import_from_doi(self, doi: str, *, collection_key: str | None = None, tags: list[str] | None = None, library_id: int = 1) -> dict:
+    def import_from_doi(
+        self,
+        doi: str,
+        *,
+        collection_key: str | None = None,
+        tags: list[str] | None = None,
+        library_id: int = 1,
+        if_missing: bool = False,
+    ) -> dict:
         safe_doi = doi.replace("'", "\\'")
         post_import_js = self._build_post_import_js(collection_key, tags, library_id)
+        existing_lookup_js = ""
+        imported_result_js = (
+            "return {status: 'imported', key: item.key, title: item.getField('title'), "
+            "doi: item.getField('DOI')};"
+        )
+        if if_missing:
+            existing_lookup_js = (
+                f"var doiSearch = new Zotero.Search(); "
+                f"doiSearch.libraryID = {library_id}; "
+                f"doiSearch.addCondition('DOI', 'is', '{safe_doi}'); "
+                f"var existingIds = await doiSearch.search(); "
+                f"if (existingIds && existingIds.length) {{ "
+                f"var existingItems = await Zotero.Items.getAsync(existingIds); "
+                f"var item = existingItems.find(i => i && !i.isAttachment() && !i.isNote()); "
+                f"if (item) {{ {post_import_js} "
+                f"return {{status: 'existing', key: item.key, title: item.getField('title'), "
+                f"doi: item.getField('DOI')}}; }} }} "
+            )
+        else:
+            imported_result_js = (
+                "return 'OK: imported ' + item.getField('title').substring(0,60) + "
+                "' (key: ' + item.key + ')';"
+            )
         js = (
+            f"{existing_lookup_js} "
             f"var translate = new Zotero.Translate.Search(); "
             f"translate.setIdentifier({{DOI: '{safe_doi}'}}); "
             f"var translators = await translate.getTranslators(); "
@@ -431,7 +463,7 @@ class JSBridgeClient:
             f"if (!items || !items.length) {{ return 'ERROR: no results for DOI {safe_doi}'; }} "
             f"var item = items[0]; "
             f"{post_import_js} "
-            f"return 'OK: imported ' + item.getField('title').substring(0,60) + ' (key: ' + item.key + ')';"
+            f"{imported_result_js}"
         )
         return self.execute_js(js, wait_seconds=30)
 
