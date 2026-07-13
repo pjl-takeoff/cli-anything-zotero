@@ -13,6 +13,7 @@ from xml.etree import ElementTree as ET
 
 from cli_anything.zotero.core import docx as docx_tools
 from cli_anything.zotero.core import discovery
+from cli_anything.zotero.core import libreoffice_linux
 from cli_anything.zotero.core.discovery import RuntimeContext
 from cli_anything.zotero.utils import zotero_paths
 
@@ -676,15 +677,26 @@ def _open_in_libreoffice(path: Path) -> dict[str, Any]:
     soffice = docx_tools._find_libreoffice_executable()
     if soffice is None:
         return {"attempted": True, "ok": False, "error": "LibreOffice executable was not found."}
+    if sys.platform.startswith("linux"):
+        command = libreoffice_linux.build_libreoffice_command(soffice, path)
+    else:
+        command = [str(soffice), str(path)]
     try:
-        subprocess.Popen([str(soffice), str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as exc:
         return {"attempted": True, "ok": False, "soffice": str(soffice), "error": str(exc)}
-    return {"attempted": True, "ok": True, "soffice": str(soffice)}
+    return {
+        "attempted": True,
+        "ok": True,
+        "soffice": str(soffice),
+        "uno_port": libreoffice_linux.DEFAULT_UNO_PORT if sys.platform.startswith("linux") else None,
+    }
 
 
 def _prime_libreoffice_active_document(path: Path) -> dict[str, Any]:
     """Create LibreOffice's active frame without leaving its document in front."""
+    if sys.platform.startswith("linux"):
+        return libreoffice_linux.run_uno_operation("wait", path)
     if sys.platform != "darwin":
         return {"attempted": False, "ok": None, "reason": "background activation is only implemented on macOS"}
     target_name = json.dumps(path.name)
@@ -766,6 +778,8 @@ def _needs_libreoffice_connection_warmup(bridge_result: dict[str, Any]) -> bool:
 
 def _warm_up_libreoffice_zotero_connection(path: Path) -> dict[str, Any]:
     """Click LibreOffice's Zotero Refresh button once to initialize the Zotero socket."""
+    if sys.platform.startswith("linux"):
+        return libreoffice_linux.run_uno_operation("wait", path)
     if sys.platform != "darwin":
         return {"attempted": False, "ok": None, "reason": "LibreOffice warmup is only implemented on macOS"}
     target_name = json.dumps(path.name)
@@ -867,6 +881,8 @@ def _friendly_conversion_error(error: str, output_path: Path) -> str:
 
 
 def _save_active_libreoffice_document(path: Path) -> dict[str, Any]:
+    if sys.platform.startswith("linux"):
+        return libreoffice_linux.run_uno_operation("store", path)
     if sys.platform != "darwin":
         return {"attempted": False, "ok": None, "reason": "automatic LibreOffice save is only implemented on macOS"}
     target_name = json.dumps(path.name)

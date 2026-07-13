@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest import mock
 from xml.etree import ElementTree as ET
 
-from cli_anything.zotero.core import analysis, catalog, discovery, docx as docx_mod, docx_static, docx_zoterify, experimental, imports as imports_mod, jsbridge, notes as notes_mod, rendering, session as session_mod
+from cli_anything.zotero.core import analysis, catalog, discovery, docx as docx_mod, docx_static, docx_zoterify, experimental, imports as imports_mod, jsbridge, libreoffice_linux, notes as notes_mod, rendering, session as session_mod
 from cli_anything.zotero.tests._helpers import create_sample_environment, fake_zotero_http_server, sample_pdf_bytes
 from cli_anything.zotero.utils import openai_api, zotero_http, zotero_paths, zotero_sqlite
 
@@ -810,6 +810,80 @@ class DocxCitationInspectionTests(unittest.TestCase):
 
         self.assertTrue(payload["ok"])
         self.assertEqual(run.call_args.args[0], ["open", "-g", "-a", "LibreOffice", str(path)])
+
+    def test_linux_open_starts_socket_enabled_libreoffice(self):
+        path = Path("/tmp/linux-background.docx")
+
+        with (
+            mock.patch.object(docx_zoterify.sys, "platform", "linux"),
+            mock.patch.object(
+                docx_zoterify.docx_tools,
+                "_find_libreoffice_executable",
+                return_value=Path("/usr/bin/libreoffice"),
+            ),
+            mock.patch.object(docx_zoterify.subprocess, "Popen") as popen,
+        ):
+            payload = docx_zoterify._open_in_libreoffice(path)
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["uno_port"], 2002)
+        self.assertEqual(
+            popen.call_args.args[0],
+            [
+                "/usr/bin/libreoffice",
+                "--nologo",
+                "--nodefault",
+                "--norestore",
+                "--nolockcheck",
+                "--accept=socket,host=127.0.0.1,port=2002;urp;StarOffice.ComponentContext",
+                str(path),
+            ],
+        )
+
+    def test_linux_prime_waits_for_target_document_through_uno(self):
+        path = Path("/tmp/linux-background.docx")
+
+        with (
+            mock.patch.object(docx_zoterify.sys, "platform", "linux"),
+            mock.patch.object(
+                libreoffice_linux,
+                "run_uno_operation",
+                return_value={"attempted": True, "ok": True, "method": "uno wait"},
+            ) as run_uno,
+        ):
+            payload = docx_zoterify._prime_libreoffice_active_document(path)
+
+        run_uno.assert_called_once_with("wait", path)
+        self.assertTrue(payload["attempted"])
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["method"], "uno wait")
+
+    def test_linux_save_persists_target_document_through_uno(self):
+        path = Path("/tmp/linux-background.docx")
+
+        with (
+            mock.patch.object(docx_zoterify.sys, "platform", "linux"),
+            mock.patch.object(
+                libreoffice_linux,
+                "run_uno_operation",
+                return_value={"attempted": True, "ok": True, "method": "uno store"},
+            ) as run_uno,
+        ):
+            payload = docx_zoterify._save_active_libreoffice_document(path)
+
+        run_uno.assert_called_once_with("store", path)
+        self.assertTrue(payload["attempted"])
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["method"], "uno store")
+
+    def test_linux_uno_operation_reports_invalid_helper_json(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="not-json", stderr="")
+
+        with mock.patch.object(libreoffice_linux.subprocess, "run", return_value=completed):
+            payload = libreoffice_linux.run_uno_operation("store", Path("/tmp/linux-background.docx"))
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "UNO helper returned invalid JSON")
 
     def test_libreoffice_warmup_does_not_raise_or_activate_window(self):
         completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
