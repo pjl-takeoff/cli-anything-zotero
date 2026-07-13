@@ -120,6 +120,12 @@ zotero-cli --json docx render-citations manuscript.docx --output manuscript-stat
 zotero-cli --json docx doctor
 zotero-cli --json docx insert-citations manuscript.docx --output manuscript-zotero.docx --force
 
+# Linux server: run the conversion in an isolated Xvfb-owned unit
+systemd-run --user --unit=zotero-docx-convert --collect --wait --pipe \
+  --working-directory="$PWD" \
+  xvfb-run -a zotero-cli --json docx insert-citations manuscript.docx \
+    --output manuscript-zotero.docx --force
+
 ### AI DOCX Citation Decision Flow
 
 When the user provides a DOCX draft that contains citations, follow this explicit branch:
@@ -137,6 +143,10 @@ When the user provides a DOCX draft that contains citations, follow this explici
   - do not retry blindly
   - report exact error context from `docx doctor`/`docx zoterify-probe`
   - offer fallback to static mode (`render-citations`)
+- On Linux, require `docx doctor` to detect LibreOffice, `python3-uno`, Xvfb,
+  xdotool, the CLI Bridge, and the Zotero LibreOffice integration before
+  conversion. Keep the persistent Zotero process separate from each
+  Xvfb-owned LibreOffice conversion unit.
 
 Keep only user-facing outputs:
 - input placeholder DOCX

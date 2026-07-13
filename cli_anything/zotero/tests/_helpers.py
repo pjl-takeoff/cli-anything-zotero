@@ -4,10 +4,26 @@ import json
 import re
 import sqlite3
 import threading
+import zipfile
 from contextlib import closing, contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
+
+
+def write_docx_with_document_xml(path: Path, body_xml: str) -> None:
+    document_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        f"<w:body>{body_xml}</w:body>"
+        "</w:document>"
+    )
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "[Content_Types].xml",
+            '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>',
+        )
+        zf.writestr("word/document.xml", document_xml)
 
 
 def sample_pdf_bytes(label: str = "sample") -> bytes:

@@ -10,7 +10,7 @@ from typing import Any
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Control one LibreOffice document through UNO.")
-    parser.add_argument("operation", choices=("wait", "store", "close"))
+    parser.add_argument("operation", choices=("wait", "refresh", "store", "close"))
     parser.add_argument("--path", required=True, type=Path)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=2002, type=int)
@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _connect(host: str, port: int) -> Any:
+def _connect(host: str, port: int) -> tuple[Any, Any]:
     import uno
 
     local_context = uno.getComponentContext()
@@ -29,10 +29,11 @@ def _connect(host: str, port: int) -> Any:
     context = resolver.resolve(
         f"uno:socket,host={host},port={port};urp;StarOffice.ComponentContext"
     )
-    return context.ServiceManager.createInstanceWithContext(
+    desktop = context.ServiceManager.createInstanceWithContext(
         "com.sun.star.frame.Desktop",
         context,
     )
+    return context, desktop
 
 
 def _find_document(desktop: Any, target_url: str) -> Any | None:
@@ -48,16 +49,16 @@ def _find_document(desktop: Any, target_url: str) -> Any | None:
     return None
 
 
-def _wait_for_document(host: str, port: int, path: Path, timeout: float) -> Any:
+def _wait_for_document(host: str, port: int, path: Path, timeout: float) -> tuple[Any, Any, Any]:
     target_url = path.expanduser().resolve().as_uri()
     deadline = time.monotonic() + timeout
     last_error: Exception | None = None
     while time.monotonic() < deadline:
         try:
-            desktop = _connect(host, port)
+            context, desktop = _connect(host, port)
             document = _find_document(desktop, target_url)
             if document is not None:
-                return document
+                return context, desktop, document
         except Exception as exc:
             last_error = exc
         time.sleep(0.25)
@@ -66,20 +67,39 @@ def _wait_for_document(host: str, port: int, path: Path, timeout: float) -> Any:
 
 
 def run(operation: str, host: str, port: int, path: Path, timeout: float) -> dict[str, Any]:
-    document = _wait_for_document(host, port, path, timeout)
-    if operation == "store":
+    context, desktop, document = _wait_for_document(host, port, path, timeout)
+    desktop_terminated = None
+    if operation == "refresh":
+        import uno
+
+        transformer = context.ServiceManager.createInstanceWithContext(
+            "com.sun.star.util.URLTransformer",
+            context,
+        )
+        command_url = uno.createUnoStruct("com.sun.star.util.URL")
+        command_url.Complete = "service:org.zotero.integration.ooo.ZoteroOpenOfficeIntegration?refresh"
+        transformer.parseStrict(command_url)
+        frame = document.getCurrentController().getFrame()
+        dispatch = frame.queryDispatch(command_url, "_self", 0)
+        if dispatch is None:
+            raise RuntimeError("LibreOffice did not expose the Zotero Refresh dispatch command")
+        dispatch.dispatch(command_url, ())
+        time.sleep(1.0)
+    elif operation == "store":
         document.store()
     elif operation == "close":
         try:
             document.close(True)
         except Exception:
             document.dispose()
+        desktop_terminated = bool(desktop.terminate())
     return {
-        "ok": True,
+        "ok": desktop_terminated is not False,
         "operation": operation,
         "path": str(path.expanduser().resolve()),
         "url": path.expanduser().resolve().as_uri(),
         "port": port,
+        "desktop_terminated": desktop_terminated,
     }
 
 
