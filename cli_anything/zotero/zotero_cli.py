@@ -1447,6 +1447,38 @@ def docx_insert_citations_command(
     return _run_docx_zoterify(ctx, path, output, backend, style, locale, field_type, bibliography, open_document, force, debug_dir)
 
 
+@docx.command("refresh")
+@click.argument("path")
+@click.option("--output", type=click.Path(dir_okay=False, path_type=Path), help="Output .docx path; defaults to an in-place refresh.")
+@click.option("--backend", default=docx_zoterify.DEFAULT_BACKEND, show_default=True, help="Word processor backend.")
+@click.option("--force", is_flag=True, help="Overwrite a distinct output file if it already exists.")
+@click.option("--debug-dir", type=click.Path(file_okay=False, path_type=Path), help="Optional directory for refresh debug JSON artifacts.")
+@click.pass_context
+def docx_refresh_command(
+    ctx: click.Context,
+    path: str,
+    output: Path | None,
+    backend: str,
+    force: bool,
+    debug_dir: Path | None,
+) -> int:
+    """Refresh existing dynamic Zotero fields in a DOCX document."""
+    try:
+        payload = docx_zoterify.refresh_document(
+            current_runtime(ctx),
+            current_bridge(ctx),
+            path,
+            output=output,
+            backend=backend,
+            overwrite=force,
+            debug_dir=debug_dir,
+        )
+    except (FileNotFoundError, FileExistsError, ValueError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    emit(ctx, payload)
+    return 0
+
+
 @docx.command("render-citations")
 @click.argument("path")
 @click.option("--output", required=True, type=click.Path(dir_okay=False, path_type=Path), help="Output .docx path.")
@@ -2066,4 +2098,3 @@ def dispatch(argv: list[str] | None = None, prog_name: str | None = None) -> int
 
 def entrypoint(argv: list[str] | None = None) -> int:
     return dispatch(argv, prog_name=sys.argv[0])
-

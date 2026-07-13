@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -189,17 +190,22 @@ def find_executable(explicit_executable: str | None = None, env: Mapping[str, st
             return candidate.resolve() if candidate.is_symlink() else candidate
 
     home = Path.home()
-    candidates = [
-        Path(r"C:\Program Files\Zotero\zotero.exe"),
-        Path(r"C:\Program Files (x86)\Zotero\zotero.exe"),
-        Path("/Applications/Zotero.app/Contents/MacOS/zotero"),
-        home / ".local" / "opt" / "Zotero_linux-x86_64" / "zotero",
-        home / ".local" / "share" / "zotero" / "zotero",
-        home / ".local" / "bin" / "zotero",
-        Path("/opt/zotero/zotero"),
-        Path("/usr/lib/zotero/zotero"),
-        Path("/usr/local/bin/zotero"),
-    ]
+    if sys.platform == "darwin":
+        candidates = [Path("/Applications/Zotero.app/Contents/MacOS/zotero")]
+    elif sys.platform.startswith("win"):
+        candidates = [
+            Path(r"C:\Program Files\Zotero\zotero.exe"),
+            Path(r"C:\Program Files (x86)\Zotero\zotero.exe"),
+        ]
+    else:
+        candidates = [
+            home / ".local" / "opt" / "Zotero_linux-x86_64" / "zotero",
+            home / ".local" / "share" / "zotero" / "zotero",
+            home / ".local" / "bin" / "zotero",
+            Path("/opt/zotero/zotero"),
+            Path("/usr/lib/zotero/zotero"),
+            Path("/usr/local/bin/zotero"),
+        ]
     for candidate in candidates:
         if candidate.exists():
             return candidate.resolve() if candidate.is_symlink() else candidate

@@ -150,6 +150,7 @@ class PathDiscoveryTests(unittest.TestCase):
             with (
                 mock.patch("cli_anything.zotero.utils.zotero_paths.Path.home", return_value=home),
                 mock.patch("cli_anything.zotero.utils.zotero_paths.shutil.which", return_value=None),
+                mock.patch.object(zotero_paths.sys, "platform", "linux"),
             ):
                 resolved = zotero_paths.find_executable(env={})
 
@@ -168,7 +169,7 @@ class PathDiscoveryTests(unittest.TestCase):
             with mock.patch("cli_anything.zotero.utils.zotero_paths.shutil.which", return_value=str(link)):
                 resolved = zotero_paths.find_executable(env={})
 
-        self.assertEqual(resolved, executable)
+        self.assertEqual(resolved, executable.resolve())
 
     def test_installed_libreoffice_plugin_paths_discovers_linux_user_profile(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -212,14 +213,19 @@ class PathDiscoveryTests(unittest.TestCase):
 
     def test_check_libreoffice_reports_linux_runtime_dependencies(self):
         dependency_paths = {"Xvfb": "/usr/bin/Xvfb", "xdotool": "/usr/bin/xdotool"}
-        with (
-            mock.patch.object(docx_mod.sys, "platform", "linux"),
-            mock.patch.object(docx_mod, "_find_libreoffice_executable", return_value=Path("/usr/bin/soffice")),
-            mock.patch.object(docx_mod, "_find_libreoffice_python", return_value=Path("/usr/bin/python3")),
-            mock.patch.object(docx_mod, "_python_imports_uno", return_value=True),
-            mock.patch.object(docx_mod.shutil, "which", side_effect=dependency_paths.get),
-        ):
-            result = docx_mod._check_libreoffice()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            soffice = Path(tmpdir) / "soffice"
+            python = Path(tmpdir) / "python3"
+            soffice.touch()
+            python.touch()
+            with (
+                mock.patch.object(docx_mod.sys, "platform", "linux"),
+                mock.patch.object(docx_mod, "_find_libreoffice_executable", return_value=soffice),
+                mock.patch.object(docx_mod, "_find_libreoffice_python", return_value=python),
+                mock.patch.object(docx_mod, "_python_imports_uno", return_value=True),
+                mock.patch.object(docx_mod.shutil, "which", side_effect=dependency_paths.get),
+            ):
+                result = docx_mod._check_libreoffice()
 
         self.assertTrue(result["ok"])
         self.assertTrue(result["uno_python_checked"])
@@ -230,14 +236,19 @@ class PathDiscoveryTests(unittest.TestCase):
 
     def test_check_libreoffice_linux_is_not_ready_without_xdotool(self):
         dependency_paths = {"Xvfb": "/usr/bin/Xvfb", "xdotool": None}
-        with (
-            mock.patch.object(docx_mod.sys, "platform", "linux"),
-            mock.patch.object(docx_mod, "_find_libreoffice_executable", return_value=Path("/usr/bin/soffice")),
-            mock.patch.object(docx_mod, "_find_libreoffice_python", return_value=Path("/usr/bin/python3")),
-            mock.patch.object(docx_mod, "_python_imports_uno", return_value=True),
-            mock.patch.object(docx_mod.shutil, "which", side_effect=dependency_paths.get),
-        ):
-            result = docx_mod._check_libreoffice()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            soffice = Path(tmpdir) / "soffice"
+            python = Path(tmpdir) / "python3"
+            soffice.touch()
+            python.touch()
+            with (
+                mock.patch.object(docx_mod.sys, "platform", "linux"),
+                mock.patch.object(docx_mod, "_find_libreoffice_executable", return_value=soffice),
+                mock.patch.object(docx_mod, "_find_libreoffice_python", return_value=python),
+                mock.patch.object(docx_mod, "_python_imports_uno", return_value=True),
+                mock.patch.object(docx_mod.shutil, "which", side_effect=dependency_paths.get),
+            ):
+                result = docx_mod._check_libreoffice()
 
         self.assertFalse(result["ok"])
 
@@ -898,6 +909,7 @@ class DocxCitationInspectionTests(unittest.TestCase):
                     "_close_active_libreoffice_document",
                     return_value={"attempted": True, "ok": True},
                 ) as close,
+                mock.patch.object(docx_zoterify.time, "sleep"),
             ):
                 payload = docx_zoterify.zoterify_document(runtime, bridge, source, output, open_document=True)
 
@@ -1019,7 +1031,115 @@ class DocxCitationInspectionTests(unittest.TestCase):
         self.assertTrue(payload["zotero_startup"]["attempted"])
         self.assertTrue(payload["has_zotero_fields"])
 
-    def test_open_in_libreoffice_does_not_activate_app_on_macos(self):
+    def test_open_in_libreoffice_launches_soffice_directly_on_macos(self):
+        path = Path("/tmp/background.docx")
+        soffice = Path("/Applications/LibreOffice.app/Contents/MacOS/soffice")
+
+        with (
+            mock.patch.object(docx_zoterify.sys, "platform", "darwin"),
+            mock.patch.object(docx_zoterify.docx_tools, "_find_libreoffice_executable", return_value=soffice),
+            mock.patch.object(
+                docx_zoterify.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+            ),
+            mock.patch.object(docx_zoterify.subprocess, "Popen") as popen,
+        ):
+            payload = docx_zoterify._open_in_libreoffice(path)
+
+        self.assertTrue(payload["ok"])
+        popen.assert_called_once_with(
+            [str(soffice), "--norestore", str(path.resolve())],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.assertEqual(payload["method"], "direct soffice")
+
+    def test_refresh_document_updates_existing_zotero_fields_in_place(self):
+        refresh_document = getattr(docx_zoterify, "refresh_document", None)
+        self.assertIsNotNone(refresh_document, "docx refresh requires a public refresh_document workflow")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = create_sample_environment(Path(tmpdir))
+            path = Path(tmpdir) / "dynamic.docx"
+            write_docx_with_zotero_bookmark_fields(path, citation_count=1, bibliography_count=1)
+            runtime = discovery.build_runtime_context(
+                backend="sqlite",
+                data_dir=str(env["data_dir"]),
+                profile_dir=str(env["profile_dir"]),
+                executable=str(env["executable"]),
+            )
+
+            class ActiveBridge:
+                def bridge_endpoint_active(self):
+                    return True
+
+            with (
+                mock.patch.object(
+                    docx_zoterify.discovery,
+                    "ensure_bridge_endpoint_ready",
+                    return_value={"ok": True, "attempted": False},
+                ),
+                mock.patch.object(
+                    docx_zoterify,
+                    "_open_in_libreoffice",
+                    return_value={"attempted": True, "ok": True},
+                ) as open_document,
+                mock.patch.object(
+                    docx_zoterify,
+                    "_prime_libreoffice_active_document",
+                    return_value={"attempted": True, "ok": True},
+                ),
+                mock.patch.object(
+                    docx_zoterify,
+                    "_warm_up_libreoffice_zotero_connection",
+                    return_value={"attempted": True, "ok": True},
+                ) as refresh,
+                mock.patch.object(
+                    docx_zoterify,
+                    "_save_active_libreoffice_document",
+                    return_value={"attempted": True, "ok": True},
+                ) as save,
+                mock.patch.object(
+                    docx_zoterify,
+                    "_close_active_libreoffice_document",
+                    return_value={"attempted": True, "ok": True},
+                ) as close,
+                mock.patch.object(docx_zoterify.time, "sleep"),
+            ):
+                payload = refresh_document(runtime, ActiveBridge(), path)
+
+            refreshed = docx_zoterify.docx_tools.inspect_citations(path, sample_limit=100)
+
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["ready_for_user"])
+        self.assertEqual(payload["output"], str(path))
+        self.assertEqual(payload["citation_fields"], 1)
+        self.assertEqual(payload["bibliography_fields"], 1)
+        self.assertEqual(refresh.call_count, 2)
+        open_document.assert_called_once()
+        save.assert_called_once()
+        close.assert_called_once()
+        self.assertEqual(refreshed["field_counts"].get("zotero"), 2)
+
+    def test_refresh_document_refuses_in_place_update_when_word_lock_exists(self):
+        refresh_document = getattr(docx_zoterify, "refresh_document", None)
+        self.assertIsNotNone(refresh_document, "docx refresh requires a public refresh_document workflow")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = create_sample_environment(Path(tmpdir))
+            path = Path(tmpdir) / "report.docx"
+            write_docx_with_zotero_bookmark_fields(path, citation_count=1, bibliography_count=1)
+            path.with_name("~$port.docx").write_bytes(b"lock")
+            runtime = discovery.build_runtime_context(
+                backend="sqlite",
+                data_dir=str(env["data_dir"]),
+                profile_dir=str(env["profile_dir"]),
+                executable=str(env["executable"]),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "Microsoft Word"):
+                refresh_document(runtime, mock.Mock(), path)
+
+    def test_close_in_libreoffice_closes_target_window_on_macos(self):
         path = Path("/tmp/background.docx")
         completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
 
@@ -1027,10 +1147,11 @@ class DocxCitationInspectionTests(unittest.TestCase):
             mock.patch.object(docx_zoterify.sys, "platform", "darwin"),
             mock.patch.object(docx_zoterify.subprocess, "run", return_value=completed) as run,
         ):
-            payload = docx_zoterify._open_in_libreoffice(path)
+            payload = docx_zoterify._close_active_libreoffice_document(path)
 
         self.assertTrue(payload["ok"])
-        self.assertEqual(run.call_args.args[0], ["open", "-g", "-a", "LibreOffice", str(path)])
+        self.assertIn(path.name, run.call_args.kwargs["input"])
+        self.assertIn("click button 1", run.call_args.kwargs["input"])
 
     def test_linux_open_starts_socket_enabled_libreoffice(self):
         path = Path("/tmp/linux-background.docx")
@@ -1046,6 +1167,7 @@ class DocxCitationInspectionTests(unittest.TestCase):
                 ),
                 mock.patch.object(libreoffice_linux, "_allocate_uno_port", return_value=43123),
                 mock.patch.object(libreoffice_linux.tempfile, "mkdtemp", return_value=str(profile_dir)),
+                mock.patch.object(libreoffice_linux, "_seed_user_installation"),
                 mock.patch.object(libreoffice_linux.subprocess, "Popen") as popen,
             ):
                 popen.return_value.pid = 9876

@@ -7,13 +7,12 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
-import time
 import unittest
 import uuid
 import zipfile
 from pathlib import Path
 
-from cli_anything.zotero.core import discovery, docx_zoterify
+from cli_anything.zotero.core import discovery
 from cli_anything.zotero.tests._helpers import sample_pdf_bytes
 from cli_anything.zotero.utils import zotero_paths, zotero_sqlite
 
@@ -382,16 +381,11 @@ class ZoteroFullE2E(unittest.TestCase):
         parsed = json.loads(csljson_data["content"])
         self.assertTrue(parsed)
 
-    @unittest.skipUnless(
-        sys.platform.startswith("linux") and os.environ.get("ZOTERO_LINUX_E2E") == "1",
-        "Linux dynamic DOCX E2E disabled",
-    )
-    @unittest.skipUnless(SAMPLE_ITEM is not None, "No regular Zotero item found for Linux DOCX E2E")
-    def test_linux_dynamic_docx_citation_and_bibliography_fields(self):
+    def assert_dynamic_docx_workflow(self, platform_name: str):
         assert SAMPLE_ITEM is not None
         with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "linux-placeholder.docx"
-            output = Path(tmpdir) / "linux-output.docx"
+            source = Path(tmpdir) / f"{platform_name}-placeholder.docx"
+            output = Path(tmpdir) / f"{platform_name}-output.docx"
             replace_docx_token(LINUX_DOCX_FIXTURE, source, "TESTKEY1", SAMPLE_ITEM["key"])
 
             conversion = self.run_cli(
@@ -420,20 +414,8 @@ class ZoteroFullE2E(unittest.TestCase):
             report = json.loads(inspection.stdout)
             instructions = [field["instruction"] for field in report["fields"]]
 
-            reopen = docx_zoterify._open_in_libreoffice(output)
-            self.assertTrue(reopen.get("ok"), msg=json.dumps(reopen, indent=2))
-            try:
-                time.sleep(3)
-                activation = docx_zoterify._prime_libreoffice_active_document(output)
-                self.assertTrue(activation.get("ok"), msg=json.dumps(activation, indent=2))
-                refresh = docx_zoterify._warm_up_libreoffice_zotero_connection(output)
-                self.assertTrue(refresh.get("ok"), msg=json.dumps(refresh, indent=2))
-                time.sleep(2)
-                save = docx_zoterify._save_active_libreoffice_document(output)
-                self.assertTrue(save.get("ok"), msg=json.dumps(save, indent=2))
-            finally:
-                close = docx_zoterify._close_active_libreoffice_document(output)
-            self.assertTrue(close.get("ok"), msg=json.dumps(close, indent=2))
+            refresh = self.run_cli(["--json", "docx", "refresh", str(output)])
+            self.assertEqual(refresh.returncode, 0, msg=refresh.stderr)
 
             refreshed = self.run_cli(["--json", "docx", "inspect-citations", str(output), "--sample-limit", "100"])
             self.assertEqual(refreshed.returncode, 0, msg=refreshed.stderr)
@@ -447,3 +429,19 @@ class ZoteroFullE2E(unittest.TestCase):
         self.assertEqual(refreshed_report["field_counts"].get("zotero"), 2)
         self.assertEqual(sum("CSL_CITATION" in instruction for instruction in refreshed_instructions), 1)
         self.assertEqual(sum("CSL_BIBLIOGRAPHY" in instruction for instruction in refreshed_instructions), 1)
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and os.environ.get("ZOTERO_LINUX_E2E") == "1",
+        "Linux dynamic DOCX E2E disabled",
+    )
+    @unittest.skipUnless(SAMPLE_ITEM is not None, "No regular Zotero item found for Linux DOCX E2E")
+    def test_linux_dynamic_docx_citation_and_bibliography_fields(self):
+        self.assert_dynamic_docx_workflow("linux")
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and os.environ.get("ZOTERO_MACOS_E2E") == "1",
+        "macOS dynamic DOCX E2E disabled",
+    )
+    @unittest.skipUnless(SAMPLE_ITEM is not None, "No regular Zotero item found for macOS DOCX E2E")
+    def test_macos_dynamic_docx_citation_and_bibliography_fields(self):
+        self.assert_dynamic_docx_workflow("macos")

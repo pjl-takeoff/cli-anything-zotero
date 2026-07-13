@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import copy
 import json
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 import zipfile
@@ -250,7 +252,7 @@ def zoterify_document(
         if open_result.get("ok"):
             time.sleep(3)
             activation_result = _prime_libreoffice_active_document(output_path)
-            if sys.platform.startswith("linux") and activation_result.get("ok") is not True:
+            if (sys.platform == "darwin" or sys.platform.startswith("linux")) and activation_result.get("ok") is not True:
                 detail = activation_result.get("error") or activation_result.get("reason") or "target document unavailable"
                 raise RuntimeError(f"LibreOffice target document activation failed: {detail}")
         zoterify_js = _zoterify_js(
@@ -303,10 +305,10 @@ def zoterify_document(
                 f"citation_fields={zotero_counts['citation']} bibliography_fields={zotero_counts['bibliography']}. "
                 "Close any existing LibreOffice window for this output file, or choose a new --output path, then rerun the same command."
             )
-        if open_result.get("ok") and sys.platform.startswith("linux"):
+        if open_result.get("ok") and (sys.platform == "darwin" or sys.platform.startswith("linux")):
             close_result = _close_active_libreoffice_document(output_path)
             if close_result.get("ok") is not True:
-                detail = close_result.get("error") or "isolated LibreOffice session did not close cleanly"
+                detail = close_result.get("error") or "LibreOffice document did not close cleanly"
                 raise RuntimeError(f"LibreOffice cleanup failed: {detail}")
             time.sleep(0.5)
         _normalize_custom_properties_for_word(output_path)
@@ -316,7 +318,11 @@ def zoterify_document(
             inspection = docx_tools.inspect_citations(output_path, sample_limit=10000)
             zotero_counts = _zotero_field_type_counts(inspection)
     except Exception:
-        if open_result.get("ok") and sys.platform.startswith("linux") and not close_result.get("attempted"):
+        if (
+            open_result.get("ok")
+            and (sys.platform == "darwin" or sys.platform.startswith("linux"))
+            and not close_result.get("attempted")
+        ):
             close_result = _close_active_libreoffice_document(output_path)
         if output_path != final_output_path and debug_path is None:
             try:
@@ -360,6 +366,128 @@ def zoterify_document(
             "debug_dir": str(debug_path) if debug_path is not None else None,
         },
         "notes": _zoterify_notes(inspection),
+    }
+
+
+def refresh_document(
+    runtime: RuntimeContext,
+    bridge: Any,
+    path: str | Path,
+    *,
+    output: str | Path | None = None,
+    backend: str = DEFAULT_BACKEND,
+    overwrite: bool = False,
+    debug_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Refresh an existing dynamic Zotero DOCX without modifying the source on failure."""
+    _require_libreoffice_backend(backend)
+    source_path = docx_tools._validated_docx_path(path)
+    final_output_path = Path(output).expanduser() if output is not None else source_path
+    same_path = source_path.resolve() == final_output_path.resolve()
+    if not same_path and final_output_path.exists() and not overwrite:
+        raise FileExistsError(f"Output already exists: {final_output_path}")
+    locks = _microsoft_word_lock_paths(final_output_path)
+    if locks:
+        raise RuntimeError(
+            "Microsoft Word currently has the target DOCX open. Close it before refreshing Zotero fields: "
+            f"{final_output_path.name}"
+        )
+
+    before = docx_tools.inspect_citations(source_path, sample_limit=10000)
+    before_counts = _zotero_field_type_counts(before)
+    if before_counts["citation"] < 1 and before_counts["bibliography"] < 1:
+        raise ValueError("The DOCX does not contain dynamic Zotero fields to refresh.")
+
+    zotero_startup = discovery.ensure_bridge_endpoint_ready(runtime, bridge)
+    if not zotero_startup.get("ok"):
+        raise RuntimeError(
+            "CLI Bridge endpoint is not active after launching Zotero. Run: zotero-cli app install-plugin, "
+            "restart Zotero, then verify with: zotero-cli app plugin-status"
+        )
+
+    final_output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=final_output_path.parent,
+        prefix=f".{final_output_path.stem}.zotero-refresh-",
+        suffix=".docx",
+        delete=False,
+    ) as temp_file:
+        working_path = Path(temp_file.name)
+    shutil.copy2(source_path, working_path)
+
+    debug_path = Path(debug_dir).expanduser() if debug_dir is not None else None
+    open_result = {"attempted": False, "ok": None}
+    activation_result = {"attempted": False, "ok": None}
+    refresh_results: list[dict[str, Any]] = []
+    save_result = {"attempted": False, "ok": None}
+    close_result = {"attempted": False, "ok": None}
+    try:
+        open_result = _open_in_libreoffice(working_path)
+        if open_result.get("ok") is not True:
+            raise RuntimeError(open_result.get("error") or "LibreOffice could not open the refresh document.")
+        time.sleep(3)
+        activation_result = _prime_libreoffice_active_document(working_path)
+        if activation_result.get("ok") is not True:
+            detail = activation_result.get("error") or activation_result.get("reason") or "target document unavailable"
+            raise RuntimeError(f"LibreOffice target document activation failed: {detail}")
+
+        for _ in range(2):
+            refresh_result = _warm_up_libreoffice_zotero_connection(working_path)
+            refresh_results.append(refresh_result)
+            if refresh_result.get("ok") is not True:
+                detail = refresh_result.get("error") or refresh_result.get("reason") or "refresh did not complete"
+                raise RuntimeError(f"LibreOffice Zotero refresh failed: {detail}")
+            time.sleep(1)
+
+        save_result = _save_active_libreoffice_document(working_path)
+        if save_result.get("ok") is not True:
+            raise RuntimeError(save_result.get("error") or "LibreOffice did not save the refreshed document.")
+        time.sleep(1)
+        close_result = _close_active_libreoffice_document(working_path)
+        if close_result.get("ok") is not True:
+            raise RuntimeError(close_result.get("error") or "LibreOffice did not close the refreshed document.")
+
+        _normalize_custom_properties_for_word(working_path)
+        after = docx_tools.inspect_citations(working_path, sample_limit=10000)
+        after_counts = _zotero_field_type_counts(after)
+        ready_for_user = after_counts == before_counts
+        if not ready_for_user:
+            raise RuntimeError(
+                "Refreshed Zotero field verification failed: "
+                f"citations={after_counts['citation']}/{before_counts['citation']}, "
+                f"bibliographies={after_counts['bibliography']}/{before_counts['bibliography']}"
+            )
+        if debug_path is not None:
+            _write_debug_json(debug_path / "01-refresh-before.json", before)
+            _write_debug_json(debug_path / "02-refresh-after.json", after)
+        working_path.replace(final_output_path)
+    except Exception:
+        if open_result.get("ok") and not close_result.get("attempted"):
+            _close_active_libreoffice_document(working_path)
+        raise
+    finally:
+        working_path.unlink(missing_ok=True)
+
+    return {
+        "ok": True,
+        "backend": backend,
+        "input": str(source_path),
+        "output": str(final_output_path),
+        "in_place": same_path,
+        "citation_fields": before_counts["citation"],
+        "bibliography_fields": before_counts["bibliography"],
+        "ready_for_user": True,
+        "open": open_result,
+        "libreoffice_activation": activation_result,
+        "refresh": refresh_results,
+        "save": save_result,
+        "close": close_result,
+        "zotero_startup": zotero_startup,
+        "artifacts": {
+            "input": str(source_path),
+            "output": str(final_output_path),
+            "debug_dir": str(debug_path) if debug_path is not None else None,
+        },
     }
 
 
@@ -683,16 +811,20 @@ def _normalize_probe_payload(data: dict[str, Any], *, bridge: Any, backend: str)
 
 
 def _open_in_libreoffice(path: Path) -> dict[str, Any]:
-    if sys.platform == "darwin":
-        try:
-            subprocess.run(["open", "-g", "-a", "LibreOffice", str(path)], capture_output=True, text=True, timeout=10, check=False)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            return {"attempted": True, "ok": False, "error": str(exc)}
-        return {"attempted": True, "ok": True, "method": "open -g -a LibreOffice"}
-
     soffice = docx_tools._find_libreoffice_executable()
     if soffice is None:
         return {"attempted": True, "ok": False, "error": "LibreOffice executable was not found."}
+    if sys.platform == "darwin":
+        try:
+            subprocess.Popen(
+                [str(soffice), "--norestore", str(path.expanduser().resolve())],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            return {"attempted": True, "ok": False, "soffice": str(soffice), "error": str(exc)}
+        return {"attempted": True, "ok": True, "method": "direct soffice", "soffice": str(soffice)}
+
     if sys.platform.startswith("linux"):
         try:
             session = libreoffice_linux.start_libreoffice_session(soffice, path)
@@ -763,6 +895,14 @@ return priorName
 
 def _working_output_path(output_path: Path) -> Path:
     return output_path.with_name(f".{output_path.stem}.zoterify-work-{uuid.uuid4().hex}{output_path.suffix}")
+
+
+def _microsoft_word_lock_paths(path: Path) -> list[Path]:
+    return [
+        candidate
+        for candidate in path.parent.glob("~$*")
+        if len(candidate.name) > 2 and path.name.endswith(candidate.name[2:])
+    ]
 
 
 def _normalize_custom_properties_for_word(path: Path) -> None:
@@ -978,6 +1118,43 @@ def _close_active_libreoffice_document(path: Path) -> dict[str, Any]:
             result["ok"] = False
             result["error"] = result.get("error") or "Isolated LibreOffice process or profile cleanup failed."
         return result
+    if sys.platform == "darwin":
+        target_name = json.dumps(path.name)
+        script = f'''
+tell application "System Events"
+  if not (exists process "soffice") then error "LibreOffice process was not found"
+  tell process "soffice"
+    set targetWindow to missing value
+    repeat with w in windows
+      try
+        if name of w contains {target_name} then
+          set targetWindow to w
+          exit repeat
+        end if
+      end try
+    end repeat
+    if targetWindow is missing value then error "LibreOffice target document window was not found: " & {target_name}
+    click button 1 of targetWindow
+  end tell
+end tell
+'''
+        try:
+            completed = subprocess.run(
+                ["osascript"],
+                input=script,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {"attempted": True, "ok": False, "error": str(exc)}
+        return {
+            "attempted": True,
+            "ok": completed.returncode == 0,
+            "method": "osascript close target window",
+            "stderr": completed.stderr.strip() or None,
+        }
     return {"attempted": False, "ok": None, "reason": "automatic close is only required by the Linux isolated-display workflow"}
 
 

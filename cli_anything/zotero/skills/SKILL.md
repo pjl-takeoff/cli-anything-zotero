@@ -120,11 +120,18 @@ zotero-cli --json docx render-citations manuscript.docx --output manuscript-stat
 zotero-cli --json docx doctor
 zotero-cli --json docx insert-citations manuscript.docx --output manuscript-zotero.docx --force
 
+# Refresh a DOCX that already contains dynamic Zotero fields
+zotero-cli --json docx refresh manuscript-zotero.docx
+
 # Linux server: run the conversion in an isolated Xvfb-owned unit
 systemd-run --user --unit=zotero-docx-convert --collect --wait --pipe \
   --working-directory="$PWD" \
   xvfb-run -a zotero-cli --json docx insert-citations manuscript.docx \
     --output manuscript-zotero.docx --force
+
+systemd-run --user --unit=zotero-docx-refresh --collect --wait --pipe \
+  --working-directory="$PWD" \
+  xvfb-run -a zotero-cli --json docx refresh manuscript-zotero.docx
 
 ### AI DOCX Citation Decision Flow
 
@@ -139,6 +146,9 @@ When the user provides a DOCX draft that contains citations, follow this explici
   - `zotero-cli --json docx validate-placeholders <docx>`
   - `zotero-cli --json docx doctor`
   - `zotero-cli --json docx insert-citations <docx> --output <final.docx> --force`
+- If the DOCX already contains dynamic Zotero fields and only needs recalculation:
+  - `zotero-cli --json docx inspect-citations <docx>`
+  - `zotero-cli --json docx refresh <docx>`
 - If dynamic conversion returns environment errors:
   - do not retry blindly
   - report exact error context from `docx doctor`/`docx zoterify-probe`

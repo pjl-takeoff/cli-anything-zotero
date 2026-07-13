@@ -124,6 +124,10 @@ systemd-run --user --unit=zotero-docx-convert --collect --wait --pipe \
   xvfb-run -a zotero-cli --json docx insert-citations manuscript.docx \
     --output manuscript-zotero.docx --style cell --bibliography auto --force
 
+systemd-run --user --unit=zotero-docx-refresh --collect --wait --pipe \
+  --working-directory="$PWD" \
+  xvfb-run -a zotero-cli --json docx refresh manuscript-zotero.docx
+
 zotero-cli --json docx inspect-citations manuscript-zotero.docx --sample-limit 100
 ```
 
@@ -337,6 +341,7 @@ zotero-cli --json docx inspect-citations manuscript.docx
 zotero-cli --json docx inspect-placeholders manuscript.docx
 zotero-cli --json docx validate-placeholders manuscript.docx
 zotero-cli --json docx insert-citations manuscript.docx --output manuscript-zotero.docx --force
+zotero-cli --json docx refresh manuscript-zotero.docx
 ```
 
 These commands automatically use the correct Local API scope for user and group libraries.
@@ -502,6 +507,7 @@ Backend:
 | `zoterify-preflight <file.docx>` | Check placeholders plus Java/LibreOffice/Zotero/plugin readiness | Diagnostic | SQLite + local app checks |
 | `zoterify-probe [--backend libreoffice]` | Probe CLI Bridge, Zotero integration, LibreOffice integration, and active document readiness | Yes | CLI Bridge + Zotero integration |
 | `insert-citations <file.docx> --output out.docx [--bibliography auto] [--debug-dir dir]` | AI-friendly command for converting placeholders into final Zotero citation and bibliography fields | Yes | DOCX XML + SQLite + CLI Bridge |
+| `refresh <file.docx> [--output out.docx] [--debug-dir dir]` | Refresh existing dynamic Zotero fields; defaults to an atomic in-place update | Yes | DOCX XML + CLI Bridge + LibreOffice |
 | `zoterify <file.docx> --output out.docx --backend libreoffice [--bibliography auto] [--debug-dir dir]` | Lower-level alias for the same conversion; debug artifacts are opt-in | Yes | DOCX XML + SQLite + CLI Bridge |
 | `prepare-zotero-import <file.docx> --experimental --output transfer.docx` | Experimental transfer-DOCX debugger; not a supported writing workflow | Debug only | DOCX XML + SQLite |
 

@@ -150,6 +150,7 @@ zotero-cli docx validate-placeholders draft.docx
 zotero-cli docx render-citations draft.docx --output draft-static.docx --force
 zotero-cli docx doctor
 zotero-cli docx insert-citations draft.docx --output draft-zotero.docx --force
+zotero-cli docx refresh draft-zotero.docx
 ```
 
 For AI-authored DOCX workflows, use Zotero-bound placeholders such as
@@ -183,8 +184,9 @@ Keep these files only as handoff artifacts:
 - No intermediate DOCX should be exposed unless `--debug-dir` is explicitly requested.
 
 Platform support for this optional workflow:
-- macOS: tested end-to-end with automatic open, conversion, save, and Word-compatible DOCX output.
-- Windows/Linux: the base CLI works, and `docx doctor` can report missing dependencies. Full automatic LibreOffice open/save for dynamic DOCX citations still needs real Windows/Linux desktop validation; users may need to open or save the LibreOffice document manually until platform automation is verified.
+- macOS: tested end-to-end with direct LibreOffice launch, automatic conversion or refresh, save, close, and Word-compatible DOCX output.
+- Linux: tested end-to-end on Ubuntu 24.04 under Xvfb with isolated LibreOffice profiles, UNO document control, and automatic cleanup.
+- Windows: the base CLI works and `docx doctor` can report missing dependencies, but full automatic LibreOffice control is not yet verified.
 
 `validate-placeholders`, `zoterify-preflight`, and `zoterify-probe` are
 diagnostics for setup or failure cases. Add `--debug-dir` only when you want

@@ -251,6 +251,10 @@ class CliEntrypointTests(unittest.TestCase):
         self.assertEqual(render.returncode, 0, msg=render.stderr)
         self.assertIn("static citation", render.stdout)
 
+        refresh = self.run_cli(["docx", "refresh", "--help"])
+        self.assertEqual(refresh.returncode, 0, msg=refresh.stderr)
+        self.assertIn("existing dynamic Zotero fields", refresh.stdout)
+
     def test_docx_render_citations_writes_static_docx(self):
         docx_path = Path(self.tmpdir.name) / "ready.docx"
         output_path = Path(self.tmpdir.name) / "static.docx"
